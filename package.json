@@ -1,0 +1,15 @@
+{
+  "name": "websuite-webhook-receiver",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Throwaway endpoint that tunnels via ngrok and logs WebSuite event deliveries to the console.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "start:local": "NO_TUNNEL=1 node index.js"
+  },
+  "dependencies": {
+    "@ngrok/ngrok": "^1.4.1",
+    "express": "^4.21.2"
+  }
+}

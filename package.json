@@ -2,11 +2,14 @@
   "name": "websuite-webhook-receiver",
   "version": "1.0.0",
   "private": true,
-  "description": "Throwaway endpoint that tunnels via ngrok and logs WebSuite event deliveries to the console.",
+  "description": "Throwaway Pylot messaging playground: tunnels via ngrok and logs event deliveries, and sends signed messages into a room with a full signature trace.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "start:local": "NO_TUNNEL=1 node index.js"
+    "start:local": "NO_TUNNEL=1 node index.js",
+    "send": "node send.js",
+    "send:check": "node send.js --check",
+    "provision": "node send.js --provision"
   },
   "dependencies": {
     "@ngrok/ngrok": "^1.4.1",

@@ -5,6 +5,11 @@
  * Opens an ngrok tunnel, prints the public URL to paste into a subscription, and
  * logs every delivery it receives: headers, signature verdict, and payload.
  *
+ * The status page also SENDS: a signed `POST /rooms/messages` (no api key, no
+ * token) with the full byte-level trace, so one page closes the loop — send a
+ * message, watch the `message.sent` delivery it causes arrive below it. The CLI
+ * equivalent is `send.js`; both share sign.js / diagnose.js.
+ *
  * Run `node index.js`. See README.md.
  */
 'use strict';
@@ -12,6 +17,10 @@
 const crypto = require('crypto');
 const path = require('path');
 const express = require('express');
+
+const { diagnose } = require('./diagnose');
+const { signedHeaders, looksLikeSecret } = require('./sign');
+const { bold, dim, red, green, yellow, cyan, magenta, line } = require('./tty');
 
 // Load `.env` from THIS directory (not the cwd) before anything reads
 // process.env. Built into Node ≥20.12, so no dotenv dependency. Absent file,
@@ -40,21 +49,17 @@ const REJECT_INVALID = process.env.REJECT_INVALID === '1';
 // almost certainly the `.env.example` placeholder copied across unedited — which
 // otherwise presents as "verification on" and then fails every signature with a
 // digest mismatch.
-const SECRET_SUSPECT = Boolean(SECRET) && !/^pwhsec_[a-f0-9]{64}$/i.test(SECRET);
+const SECRET_SUSPECT = Boolean(SECRET) && !looksLikeSecret(SECRET);
 
-// ------------------------------------------------------------------ tty
-const useColor = process.stdout.isTTY && process.env.NO_COLOR === undefined;
-const c = (code) => (s) => (useColor ? `\x1b[${code}m${s}\x1b[0m` : String(s));
-const bold = c('1');
-const dim = c('2');
-const red = c('31');
-const green = c('32');
-const yellow = c('33');
-const blue = c('34');
-const magenta = c('35');
-const cyan = c('36');
-
-const line = (ch = '─') => dim(ch.repeat(Math.min(process.stdout.columns || 80, 100)));
+// ── Sender config (the other direction) ──────────────────────────────────────
+// SEPARATE secret from the one above, on purpose. `WEBSUITE_WEBHOOK_SECRET` is a
+// SUBSCRIPTION secret and verifies what Pylot sends us; `PYLOT_SIGNING_SECRET`
+// is the TEAM SIGNING KEY and authenticates what we send Pylot. Both are
+// `pwhsec_…`, neither verifies the other, and conflating them is the classic
+// way to spend an afternoon on an unexplained 403.
+const API_URL = (process.env.PYLOT_API_URL || 'http://localhost:4000/api/v2').replace(/\/+$/, '');
+const SIGNING_SECRET = process.env.PYLOT_SIGNING_SECRET || '';
+const ROOM_ID = process.env.PYLOT_ROOM_ID || '';
 
 /** Colour an event type by family so the stream is skimmable. */
 function paintEvent(type) {
@@ -177,8 +182,122 @@ function snapshot() {
     rejectInvalid: REJECT_INVALID,
     tolerance: TOLERANCE_SECONDS,
     recent,
+    sender: {
+      apiUrl: API_URL,
+      hasSigningKey: Boolean(SIGNING_SECRET),
+      signingKeySuspect: Boolean(SIGNING_SECRET) && !looksLikeSecret(SIGNING_SECRET),
+      signingKeyHint: SIGNING_SECRET ? SIGNING_SECRET.slice(0, 11) + '…' : null,
+      roomId: ROOM_ID,
+    },
   };
 }
+
+// ---------------------------------------------------------------- sender
+/**
+ * Sign and forward a message to `POST /rooms/messages`, and hand back the whole
+ * trace: the exact bytes signed, the exact bytes sent, the headers, the
+ * platform's answer, and — when it refuses — the likely causes.
+ *
+ * This proxies rather than letting the browser call the platform directly, and
+ * that is the point: the signing key must never leave the server. A signature
+ * computed in a browser means the key is in the browser, which means anyone
+ * with devtools can send as the team.
+ */
+app.post('/_send', async (req, res) => {
+  const { roomId, userConnectionId, transportId, text, body: overrideBody } = req.body || {};
+
+  let payload;
+  if (typeof overrideBody === 'string' && overrideBody.trim()) {
+    try {
+      payload = JSON.parse(overrideBody);
+    } catch (err) {
+      res.status(400).json({ error: `raw body is not valid JSON: ${err.message}` });
+      return;
+    }
+  } else {
+    const message = { type: 'text', text: { value: String(text || '').trim() || 'Hello 👋' } };
+    payload = roomId
+      ? { roomId: String(roomId), message }
+      : {
+          userConnectionId: String(userConnectionId || ''),
+          ...(transportId ? { transportId: String(transportId) } : {}),
+          message,
+        };
+  }
+
+  if (!payload.roomId && !payload.userConnectionId) {
+    res.status(400).json({ error: 'No target — give a roomId, or a userConnectionId (+ transportId).' });
+    return;
+  }
+
+  // Serialize ONCE. This exact string is hashed and then sent; the scheme rests
+  // on those being the same bytes.
+  const rawBody = JSON.stringify(payload);
+  const { headers, signedContent, timestamp } = signedHeaders(rawBody, SIGNING_SECRET);
+  const url = `${API_URL}/rooms/messages`;
+
+  let upstream;
+  let responseText = '';
+  try {
+    upstream = await fetch(url, { method: 'POST', headers, body: rawBody });
+    responseText = await upstream.text();
+  } catch (err) {
+    res.status(502).json({
+      error: `could not reach ${url} — ${err.message}`,
+      request: { url, headers, rawBody, signedContent },
+    });
+    return;
+  }
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(responseText);
+  } catch {
+    /* non-JSON — returned raw below */
+  }
+
+  // Measured against the SERVER's clock, which is the one the ±300s window is
+  // enforced against. Local drift is invisible until it isn't.
+  const serverDateHeader = upstream.headers.get('date');
+  const serverSeconds = serverDateHeader ? Math.floor(new Date(serverDateHeader).getTime() / 1000) : NaN;
+  const skew = Number.isFinite(serverSeconds) ? Math.floor(Date.now() / 1000) - serverSeconds : null;
+  const requestAge = Number.isFinite(serverSeconds) ? serverSeconds - Number(timestamp) : null;
+
+  const ok = upstream.ok && parsed && parsed.data && parsed.data.queued;
+  const notes = ok
+    ? []
+    : diagnose({
+        status: upstream.status,
+        secret: SIGNING_SECRET,
+        skew,
+        requestAge,
+        signedContent,
+        rawBody,
+        timestamp,
+        payload,
+      });
+
+  console.log('');
+  console.log(line());
+  console.log(
+    `${dim('→ send')}  ${ok ? green(bold('✔ ' + upstream.status)) : red(bold('✘ ' + upstream.status))}  ${dim(url)}`,
+  );
+  console.log(`  ${dim('signed  ')}  ${JSON.stringify(signedContent)}`);
+  if (!ok) {
+    notes.forEach((n) => console.log(`  ${yellow('•')} ${n}`));
+  }
+
+  res.status(200).json({
+    ok: Boolean(ok),
+    status: upstream.status,
+    // The secret itself never appears here — only the signature derived from it.
+    request: { url, headers, rawBody, signedContent },
+    response: parsed ?? responseText,
+    skew,
+    requestAge,
+    notes,
+  });
+});
 
 app.get('/_state', (_req, res) => res.json(snapshot()));
 
@@ -255,7 +374,7 @@ app.get('/', (_req, res) => {
   res.type('html').send(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WebSuite webhook receiver</title>
+<title>Pylot messaging playground</title>
 <style>
   :root {
     --bg:#fbfaf7; --fg:#1c1b19; --dim:#6b6862; --card:#fff; --line:#e6e2da;
@@ -303,14 +422,24 @@ app.get('/', (_req, res) => {
   pre { background:var(--bg); border:1px solid var(--line); border-radius:6px;
         padding:.7rem .8rem; overflow-x:auto; font-size:.8rem; margin:0; }
   .ev.message { color:var(--accent); } .ev.room { color:var(--warn); } .ev.failed { color:var(--bad); }
+  input, textarea { font:inherit; width:100%; padding:.45rem .55rem; border:1px solid var(--line);
+                    border-radius:6px; background:var(--bg); color:var(--fg); }
+  textarea { min-height:3.2rem; resize:vertical; }
+  label.f { display:block; margin:0 0 .7rem; }
+  label.f span { display:block; font-size:.78rem; color:var(--dim); margin:0 0 .25rem; }
+  .row { display:flex; gap:.7rem; align-items:center; margin-top:.2rem; }
+  .send-out { margin:.9rem 0 0; }
+  .send-out .verdict { font-weight:600; margin:0 0 .5rem; }
+  .send-out ul { margin:.5rem 0 0; padding-left:1.1rem; font-size:.85rem; color:var(--dim); }
+  .send-out li { margin:.3rem 0; }
   .stats { display:flex; gap:1.5rem; flex-wrap:wrap; margin:0; }
   .stat b { display:block; font-size:1.5rem; font-weight:600; }
   .stat span { color:var(--dim); font-size:.8rem; }
   a { color:var(--accent); }
 </style></head><body><main>
 
-  <h1>WebSuite webhook receiver</h1>
-  <p class="sub">Listening for event deliveries. This page refreshes itself.</p>
+  <h1>Pylot messaging playground</h1>
+  <p class="sub">Send a signed message, watch the deliveries it causes arrive. This page refreshes itself.</p>
 
   <div class="card url">
     ${
@@ -342,6 +471,34 @@ app.get('/', (_req, res) => {
     </p>
   </div>
 
+  <h2>Send a message</h2>
+  <div class="card">
+    ${
+      s.sender.hasSigningKey
+        ? s.sender.signingKeySuspect
+          ? `<p class="bad" style="margin:0 0 .8rem"><strong>PYLOT_SIGNING_SECRET doesn't look like a real key</strong> — expected <code>pwhsec_</code> + 64 hex. Every send will 403.</p>`
+          : ''
+        : `<p class="warn" style="margin:0 0 .8rem">Set <code>PYLOT_SIGNING_SECRET</code> in <code>.env</code> and restart. Get it from <code>GET /rooms/signing-key</code>, or run <code>node send.js --provision</code>.</p>`
+    }
+    <p class="dim" style="margin:0 0 .9rem;font-size:.85rem">
+      Signed with the team key — no api key, no token. Posted to
+      <code>${esc(s.sender.apiUrl)}/rooms/messages</code>${
+        s.sender.signingKeyHint ? ` as <code>${esc(s.sender.signingKeyHint)}</code>` : ''
+      }. The key stays on this server; the browser only ever sees the signature.
+    </p>
+    <label class="f"><span>roomId</span><input id="f-room" value="${esc(s.sender.roomId)}" placeholder="664f0f1e2c9a4b0012ab34cd"></label>
+    <label class="f"><span>message</span><textarea id="f-text">Hello from the receiver 👋</textarea></label>
+    <details style="margin:0 0 .8rem">
+      <summary class="dim" style="cursor:pointer;font-size:.85rem">Raw body (overrides the fields above)</summary>
+      <textarea id="f-body" style="margin-top:.5rem" class="mono" placeholder='{"roomId":"…","message":{"type":"text","text":{"value":"hi"}}}'></textarea>
+    </details>
+    <div class="row">
+      <button id="f-send">Send signed</button>
+      <span class="dim" style="font-size:.85rem">the resulting <code>message.sent</code> delivery appears below</span>
+    </div>
+    <div class="send-out" id="f-out"></div>
+  </div>
+
   <h2>Recent deliveries</h2>
   <div class="card" style="padding:.15rem .6rem">${rows}</div>
 
@@ -356,6 +513,71 @@ REJECT_INVALID=1                   # reply 401 on a bad signature, to see retrie
   </div>
 
 <script>
+  // Everything the send returned, laid out so a 403 is diagnosable without
+  // leaving the page: what was signed, what was sent, and why it likely failed.
+  const esc = (v) => String(v).replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  const out = document.getElementById('f-out');
+  const btn = document.getElementById('f-send');
+
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    out.innerHTML = '<p class="dim">Signing and sending…</p>';
+    let r;
+    try {
+      r = await (await fetch('/_send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roomId: document.getElementById('f-room').value.trim(),
+          text: document.getElementById('f-text').value,
+          body: document.getElementById('f-body').value,
+        }),
+      })).json();
+    } catch (e) {
+      out.innerHTML = '<p class="bad">' + esc(e.message) + '</p>';
+      btn.disabled = false;
+      return;
+    }
+    if (r.error) {
+      out.innerHTML = '<p class="bad">' + esc(r.error) + '</p>';
+      btn.disabled = false;
+      return;
+    }
+
+    const d = (r.response && r.response.data) || {};
+    const head = r.ok
+      ? '<p class="verdict ok">✔ ' + r.status + ' queued — room ' + esc(d.roomId || '?') +
+        ', message ' + esc(d.messageId || '?') + '</p>' +
+        '<p class="dim" style="font-size:.85rem;margin:0">Accepted by the room pipeline — not yet delivered to the customer.</p>'
+      : '<p class="verdict bad">✘ ' + r.status + ' ' + esc((r.response && r.response.msg) || '') + '</p>' +
+        (r.status === 403
+          ? '<p class="dim" style="font-size:.85rem;margin:0">The platform will not say which half of the signature was wrong. Likely causes:</p>'
+          : '');
+
+    const notes = r.notes && r.notes.length
+      ? '<ul>' + r.notes.map((n) => '<li>' + esc(n) + '</li>').join('') + '</ul>'
+      : '';
+
+    const trace =
+      '<details style="margin-top:.8rem"><summary class="dim" style="cursor:pointer;font-size:.85rem">Signature trace</summary>' +
+      '<table class="hdr" style="margin-top:.5rem">' +
+      Object.entries(r.request.headers).map(([k, v]) =>
+        '<tr><td class="mono dim">' + esc(k) + '</td><td class="mono brk">' + esc(v) + '</td></tr>').join('') +
+      (r.skew !== null ? '<tr><td class="mono dim">clock skew</td><td class="mono">' + esc(r.skew) + 's</td></tr>' : '') +
+      (r.requestAge !== null ? '<tr><td class="mono dim">age at server</td><td class="mono">' + esc(r.requestAge) + 's</td></tr>' : '') +
+      '</table>' +
+      '<p class="dim" style="font-size:.78rem;margin:.6rem 0 .2rem">signed bytes — HMAC-SHA256 over exactly this</p>' +
+      '<pre class="mono">' + esc(JSON.stringify(r.request.signedContent)) + '</pre>' +
+      '<p class="dim" style="font-size:.78rem;margin:.6rem 0 .2rem">body sent</p>' +
+      '<pre class="mono">' + esc(r.request.rawBody) + '</pre>' +
+      '<p class="dim" style="font-size:.78rem;margin:.6rem 0 .2rem">response</p>' +
+      '<pre class="mono">' + esc(JSON.stringify(r.response, null, 2)) + '</pre>' +
+      '</details>';
+
+    out.innerHTML = head + notes + trace;
+    btn.disabled = false;
+  });
+
   // Poll rather than reload, so a copied URL selection and scroll position survive.
   setInterval(async () => {
     try {
@@ -524,7 +746,7 @@ async function main() {
   await new Promise((resolve) => app.listen(PORT, resolve));
 
   console.log('');
-  console.log(bold('  WebSuite webhook receiver'));
+  console.log(bold('  Pylot messaging playground'));
   console.log(line('═'));
   console.log(`  ${dim('local   ')}  http://localhost:${PORT}${PATH}`);
 
@@ -565,8 +787,19 @@ async function main() {
       envFileLoaded ? dim(`.env loaded from ${__dirname}`) : yellow(`no .env found in ${__dirname} — using exported vars only`)
     }`,
   );
+  if (SIGNING_SECRET && !looksLikeSecret(SIGNING_SECRET)) {
+    console.log(
+      `  ${red('sending ')}  ${SIGNING_SECRET.slice(0, 11)}… ${red('— not a valid signing key')} ${dim('(expected pwhsec_ + 64 hex)')}`,
+    );
+  } else if (SIGNING_SECRET) {
+    console.log(`  ${dim('sending ')}  ${dim(`${SIGNING_SECRET.slice(0, 11)}… → ${API_URL}/rooms/messages`)}`);
+  } else {
+    console.log(
+      `  ${yellow('No PYLOT_SIGNING_SECRET set')} ${dim('— sending is off. Run `node send.js --provision`.')}`,
+    );
+  }
   console.log(
-    `  ${dim('setup   ')}  ${bold(`http://localhost:${PORT}/`)} ${dim('— status + setup instructions')}`,
+    `  ${dim('setup   ')}  ${bold(`http://localhost:${PORT}/`)} ${dim('— status, setup, and the send panel')}`,
   );
   console.log(line('═'));
   console.log(dim('  Waiting for deliveries…  (ctrl-c to stop)'));

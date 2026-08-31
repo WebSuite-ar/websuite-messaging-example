@@ -1,12 +1,23 @@
-# WebSuite webhook receiver
+# WebSuite messaging playground
 
-A throwaway endpoint for watching WebSuite event deliveries. It opens an ngrok
-tunnel, prints the public URL to paste into a subscription, and shows every
-delivery it receives — headers, payload, and signature verdict — in a web UI and
-the console.
+A throwaway box for working on both halves of the Pylot messaging surface.
 
-Use it while building the receiving half of a webhook integration: point a
-subscription at it, fire a test event, and see exactly what arrives.
+- **Receive** — opens an ngrok tunnel, prints the public URL to paste into a
+  subscription, and shows every delivery that arrives: headers, payload, and
+  signature verdict, in a web UI and the console.
+- **Send** — signs a `POST /rooms/messages` with the team key (**no api key, no
+  token**) and shows exactly what went on the wire: the bytes that were hashed,
+  the digest, the headers, and — when the platform refuses — why it probably did.
+
+Run both and you have the whole loop: send a message, watch the `message.sent`
+delivery it causes land in the same page.
+
+| File | What it is |
+| --- | --- |
+| `index.js` | the receiver + the status page (which can also send) |
+| `send.js` | the sender, as a CLI with a `--debug` trace |
+| `sign.js` | the signing primitive, shared by both |
+| `diagnose.js` | "why was this 403'd", shared by both |
 
 ## Setup
 
@@ -15,16 +26,25 @@ npm install
 cp .env.example .env      # then fill it in
 ```
 
-Two values matter:
+Three values matter:
 
 - **`WEBSUITE_WEBHOOK_SECRET`** — the `pwhsec_…` secret returned *once* by
   **Create subscription**. Without it the receiver still prints payloads but
   cannot verify them, and says so loudly.
+- **`PYLOT_SIGNING_SECRET`** — the `pwhsec_…` **team signing key**, for sending.
+  `npm run provision` fetches it. Without it, sending is off.
 - **`NGROK_AUTHTOKEN`** — a free token from
   [ngrok](https://dashboard.ngrok.com/get-started/your-authtoken). Without it the
   receiver runs local-only and the platform cannot reach it.
 
-## Run
+> **The two `pwhsec_…` secrets are not interchangeable.** One verifies what Pylot
+> sends *out* to you (a subscription secret); the other authenticates what you
+> send *in* (the team signing key). Both HMAC identically, so swapping them fails
+> silently-ish: a digest mismatch on the way in, an unexplained 403 on the way
+> out. Nothing else about them differs, which is exactly why it costs people an
+> afternoon.
+
+## Receiving
 
 ```bash
 npm start
@@ -75,6 +95,115 @@ explicitly because they are the ones that confuse people:
 A failed signature prints the actual reason — stale timestamp with the measured
 clock skew, digest mismatch, malformed hex — rather than a bare "invalid".
 
+## Sending a message
+
+The other direction: get a message into a room from a system that has **no JWT
+and no API key**, by signing the request body with the team's HMAC key.
+
+### 1. Get the key
+
+```bash
+npm run provision          # GET /rooms/signing-key, needs PYLOT_TOKEN once
+```
+
+```
+  ✔ team 0f3f…-uuid (existing key)
+
+  PYLOT_SIGNING_SECRET=pwhsec_9c1a…
+```
+
+Put that in `.env`. It's the *only* credential the sender needs afterwards —
+that one JWT was just to fetch it. Rotating (`POST /rooms/signing-key/rotate`)
+invalidates it immediately, with no grace window.
+
+### 2. Send
+
+```bash
+npm run send -- --text "Your order #1042 has shipped 📦"
+node send.js --room 664f… --text "hi"
+node send.js --connection 664f… --to 18095550123 --name Jane --text "Hi Jane 👋"
+node send.js --body '{"roomId":"664f…","message":{"type":"text","text":{"value":"hi"}}}'
+```
+
+```
+  Send (HMAC signed)
+════════════════════════════════════════════════════════
+  POST        https://api.pylot.io/api/v2/rooms/messages
+  target      room 664f0f1e2c9a4b0012ab34cd
+  key         pwhsec_9c1a…
+  timestamp   1756612800
+  signature   sha256=f989728a3eaedfede600653c…
+
+  ✔ 200 queued
+  room        664f0f1e2c9a4b0012ab34cd
+  message     a1b2c3d4e5f6…
+```
+
+`queued` means accepted by the room pipeline — **not** delivered to the customer
+yet. Subscribe to `message.sent` / `message.failed` and leave `npm start`
+running to watch it actually land.
+
+Or use the **Send a message** panel on the receiver's status page, which does the
+same thing with the trace rendered inline — and shows the resulting delivery
+directly underneath it.
+
+### 3. Debug
+
+A rejected signature comes back as a bare `403 E_UNAUTHORIZED`. That is
+deliberate: the platform will not tell an unauthenticated caller which half of
+its signature was wrong, and the real reason goes to the server-side
+`AUTH_REJECT` log. So everything needed to work it out is printed locally
+instead.
+
+```bash
+node send.js --text hi --debug
+```
+
+```
+  signed      105 bytes
+  │ "1756612800.{\"roomId\":\"664f…\",\"message\":{…}}"
+  body sent   94 bytes
+  │ "{\"roomId\":\"664f…\",\"message\":{…}}"
+  ────────────────────────────────────────────────────
+  curl repro:
+  curl -sS -X POST "https://api.pylot.io/api/v2/rooms/messages" \
+    -H "Content-Type: application/json" \
+    -H "x-pylot-timestamp: 1756612800" \
+    -H "x-pylot-signature: sha256=f98972…" \
+    --data-raw "{…}"
+```
+
+On a rejection it names the likely causes rather than leaving you guessing:
+
+```
+  ✘ 403 E_UNAUTHORIZED
+
+  • the timestamp was 600s old when it reached the server, outside the ±300s
+    replay window — rejected regardless of how correct the digest is.
+  • the key may have been rotated since it was cached…
+```
+
+Three flags reproduce the failures on demand, so you can see what each one looks
+like before meeting it in production:
+
+| Flag | Reproduces |
+| --- | --- |
+| `--stale` | signs with a 10-minute-old timestamp — a *correct* signature outside the replay window. This is what clock drift looks like. |
+| `--tamper` | alters the body after signing — what hashing one serialization and sending another looks like. |
+| `--unsigned` | sends with `PYLOT_TOKEN` as a Bearer instead, to compare the two auth models on the same endpoint. |
+
+And before any of that:
+
+```bash
+npm run send:check
+```
+
+checks the config and **measures this host's clock against the server's** — skew
+is invisible locally and produces a flawless signature that is rejected anyway.
+
+The full scheme, with Node / Python / PHP / curl implementations and a
+failure-cause table, is in `ts-node-be/docs/signing-room-messages.md`.
+
 ## Options
 
 | Variable | Default | Purpose |
@@ -87,6 +216,11 @@ clock skew, digest mismatch, malformed hex — rather than a bare "invalid".
 | `TOLERANCE_SECONDS` | `300` | Replay window, matching the platform. |
 | `REJECT_INVALID` | off | Reply **401** on a bad signature instead of 200. Use this to watch the platform's retry schedule (1/3/10/30/60s, cap 5) actually fire. |
 | `NO_TUNNEL` | off | Skip ngrok entirely (`npm run start:local`). |
+| `PYLOT_API_URL` | `http://localhost:4000/api/v2` | Where to send. |
+| `PYLOT_SIGNING_SECRET` | — | Team signing key. Omit and sending is off. |
+| `PYLOT_ROOM_ID` | — | Default send target. |
+| `PYLOT_USER_CONNECTION_ID` | — | Default channel, for connect+send. |
+| `PYLOT_TOKEN` | — | JWT. Only `--provision` and `--unsigned` use it. |
 
 By default **every** delivery is acked with 200, including ones that fail
 verification — this is an inspection tool first, and you want to see the payload
@@ -103,3 +237,11 @@ that failed. `REJECT_INVALID=1` makes it behave like a real receiver.
   immediately, and stay well inside the 10s dispatch timeout.
 - Headers carry the literal token `pylot` (`x-pylot-signature`, …). Those are
   wire values, not branding — see the collection description.
+- `sign.js` takes the body as a **string**, never an object to serialize. That is
+  the one design decision worth copying: accepting an object would let the signer
+  serialize one way and the HTTP client another, and a body that is hashed
+  differently from how it is sent is the single most common cause of a rejected
+  signature. Serialize once, hash that string, send that string.
+- The web panel signs on the **server** and proxies. A signature computed in a
+  browser means the key is in the browser, which means anyone with devtools can
+  send as the team. The key never leaves this process.

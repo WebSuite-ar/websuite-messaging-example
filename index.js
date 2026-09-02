@@ -19,6 +19,7 @@ const path = require('path');
 const express = require('express');
 
 const { diagnose } = require('./diagnose');
+const { resolveLocale, translator, LOCALE_COOKIE, SUPPORTED } = require('./i18n');
 const {
   signRequest,
   signedHeaders,
@@ -249,16 +250,17 @@ function snapshot() {
  * with devtools can send as the team.
  */
 app.post('/_send', async (req, res) => {
+  // The browser's language reaches the JSON endpoints the same way it reaches
+  // the page — cookie or Accept-Language — so the diagnostics come back in the
+  // language the page is being read in.
+  const tt = translator(resolveLocale(req));
   const { roomId, userConnectionId, transportId, text, body: overrideBody } = req.body || {};
 
   // The key can come from the panel instead of `.env` — see resolveSigningKey.
   const { secret, source: keySource } = resolveSigningKey(req.body && req.body.signingKey);
   const apiUrl = resolveApiUrl(req.body && req.body.apiUrl);
   if (!secret) {
-    res.status(400).json({
-      error:
-        'No signing key. Paste one into the Signing key field, or set PYLOT_SIGNING_SECRET in .env — get it from GET /rooms/signing-key or `node send.js --provision`.',
-    });
+    res.status(400).json({ error: tt('err.noSigningKeySend') });
     return;
   }
 
@@ -267,7 +269,7 @@ app.post('/_send', async (req, res) => {
     try {
       payload = JSON.parse(overrideBody);
     } catch (err) {
-      res.status(400).json({ error: `raw body is not valid JSON: ${err.message}` });
+      res.status(400).json({ error: tt('err.rawBodyInvalidJson', { message: err.message }) });
       return;
     }
   } else {
@@ -282,7 +284,7 @@ app.post('/_send', async (req, res) => {
   }
 
   if (!payload.roomId && !payload.userConnectionId) {
-    res.status(400).json({ error: 'No target — give a roomId, or a userConnectionId (+ transportId).' });
+    res.status(400).json({ error: tt('err.noTarget') });
     return;
   }
 
@@ -299,7 +301,7 @@ app.post('/_send', async (req, res) => {
     responseText = await upstream.text();
   } catch (err) {
     res.status(502).json({
-      error: `could not reach ${url} — ${err.message}`,
+      error: tt('err.unreachable', { url, message: err.message }),
       request: { url, headers, rawBody, signedContent, curl: asCurl(url, headers, rawBody) },
       keySource,
       keyHint: keyHint(secret),
@@ -333,6 +335,7 @@ app.post('/_send', async (req, res) => {
         rawBody,
         timestamp,
         payload,
+        locale: resolveLocale(req),
       });
 
   console.log('');
@@ -371,19 +374,18 @@ app.post('/_send', async (req, res) => {
  * two differing is the single most common cause of a 403 nobody can explain.
  */
 app.post('/_sign', (req, res) => {
+  const tt = translator(resolveLocale(req));
   const { body: input, timestamp: tsInput } = req.body || {};
   const { secret, source: keySource } = resolveSigningKey(req.body && req.body.signingKey);
   const apiUrl = resolveApiUrl(req.body && req.body.apiUrl);
 
   const rawBody = typeof input === 'string' ? input : '';
   if (!rawBody.trim()) {
-    res.status(400).json({ error: 'Nothing to sign — paste the request body you intend to send.' });
+    res.status(400).json({ error: tt('err.nothingToSign') });
     return;
   }
   if (!secret) {
-    res.status(400).json({
-      error: 'No signing key. Paste one above, or set PYLOT_SIGNING_SECRET in .env.',
-    });
+    res.status(400).json({ error: tt('err.noSigningKeySign') });
     return;
   }
 
@@ -393,7 +395,7 @@ app.post('/_sign', (req, res) => {
   if (tsRaw) {
     const n = Number(tsRaw);
     if (!Number.isFinite(n)) {
-      res.status(400).json({ error: `\`${tsRaw}\` is not unix seconds. Leave it blank for now.` });
+      res.status(400).json({ error: tt('err.notUnixSeconds', { value: tsRaw }) });
       return;
     }
     seconds = Math.floor(n);
@@ -422,24 +424,16 @@ app.post('/_sign', (req, res) => {
 
   const warnings = [];
   if (!looksLikeSecret(secret)) {
-    warnings.push(
-      'That key does not look real — expected `pwhsec_` + 64 hex chars. The digest below is still arithmetically correct; the platform will simply 403 it.',
-    );
+    warnings.push(tt('warn.keyNotReal'));
   }
   if (jsonError) {
-    warnings.push(
-      `The body is not valid JSON (${jsonError}). It was signed anyway, byte for byte — but POST /rooms/messages answers 400 before the signature matters.`,
-    );
+    warnings.push(tt('warn.bodyNotJson', { error: jsonError }));
   }
   if (compact && compact.differs) {
-    warnings.push(
-      'This body is not compact, so any client that re-serializes it (a JSON.parse → JSON.stringify round trip, most HTTP libraries given an object) puts different bytes on the wire than the ones hashed here. Send exactly these bytes, or sign the compact form shown below.',
-    );
+    warnings.push(tt('warn.notCompact'));
   }
   if (expired) {
-    warnings.push(
-      `The timestamp is ${age}s old, outside the ±${SEND_TOLERANCE}s replay window — this signature is already expired and gets a 403 however correct the digest is.`,
-    );
+    warnings.push(tt('warn.expired', { age, tolerance: SEND_TOLERANCE }));
   }
 
   res.status(200).json({
@@ -465,8 +459,21 @@ app.post('/_sign', (req, res) => {
 
 app.get('/_state', (_req, res) => res.json(snapshot()));
 
-app.get('/', (_req, res) => {
+app.get('/', (req, res) => {
   const s = snapshot();
+  const locale = resolveLocale(req);
+  const tt = translator(locale);
+  // A `?lang=` click is also a preference: persist it so the next plain load
+  // keeps it. Without this the toggle would only hold while the query string
+  // stayed in the URL, and the first internal reload would snap back to
+  // Accept-Language.
+  if (req.query && req.query.lang && SUPPORTED.includes(locale)) {
+    res.setHeader(
+      'Set-Cookie',
+      `${LOCALE_COOKIE}=${locale}; Path=/; Max-Age=31536000; SameSite=Lax`,
+    );
+  }
+  const other = locale === 'es' ? 'en' : 'es';
 
   // Only the steps that are actually still outstanding — a checklist that stays
   // green once you're set up is noise.
@@ -474,37 +481,31 @@ app.get('/', (_req, res) => {
   if (!s.endpoint) {
     todo.push(
       s.tunnel === 'no-token'
-        ? `Set <code>NGROK_AUTHTOKEN</code> in <code>.env</code> and restart, to get a public URL the platform can reach. <a href="https://dashboard.ngrok.com/get-started/your-authtoken">Get a free token</a>.`
+        ? tt('todo.noToken')
         : s.tunnel === 'disabled'
-          ? `Tunnel is off (<code>NO_TUNNEL=1</code>). Point the collection's <em>Simulate a signed delivery</em> at the local URL, or restart without the flag for a public one.`
-          : `ngrok failed to start — check the console output, then restart.`,
+          ? tt('todo.tunnelDisabled')
+          : tt('todo.tunnelFailed'),
     );
   }
   if (!s.hasSecret) {
-    todo.push(
-      `Set <code>WEBSUITE_WEBHOOK_SECRET</code> in <code>.env</code> and restart. It's the <code>pwhsec_…</code> value returned <strong>once</strong> by <em>Create subscription</em>. Until then payloads are shown but not verified.`,
-    );
+    todo.push(tt('todo.noSecret'));
   }
   if (s.secretSuspect) {
-    todo.push(
-      `<strong class="bad">Your <code>WEBSUITE_WEBHOOK_SECRET</code> doesn't look like a real one.</strong> It should be <code>pwhsec_</code> followed by 64 hex characters — yours looks like the <code>.env.example</code> placeholder. Every signature will fail with a digest mismatch until you paste the value from <em>Create subscription</em> (or <em>Rotate subscription secret</em>).`,
-    );
+    todo.push(tt('todo.secretSuspect'));
   }
   if (!s.envFileLoaded) {
-    todo.push(`No <code>.env</code> found in <code>${esc(s.envDir)}</code> — copy <code>.env.example</code> to <code>.env</code>. Exported shell vars work too. Sending works without it: paste the key into the <em>Send</em> tab.`);
+    todo.push(tt('todo.noEnvFile', { dir: esc(s.envDir) }));
   }
   if (s.endpoint && s.hasSecret && !s.total) {
-    todo.push(
-      `Ready. Create a subscription pointing at the URL above, then fire <em>Send test event</em> from the Postman collection.`,
-    );
+    todo.push(tt('todo.ready'));
   }
 
   const badge = (d) =>
     d.verdict === 'ok'
-      ? '<span class="ok">✔ verified</span>'
+      ? `<span class="ok">${tt('deliveries.verified')}</span>`
       : d.verdict === 'skipped'
-        ? '<span class="warn">… unchecked</span>'
-        : `<span class="bad">✘ invalid</span>`;
+        ? `<span class="warn">${tt('deliveries.unchecked')}</span>`
+        : `<span class="bad">${tt('deliveries.invalid')}</span>`;
 
   const rows = s.recent.length
     ? s.recent
@@ -513,7 +514,7 @@ app.get('/', (_req, res) => {
         <summary>
           <span class="mono dim">${esc(d.at.slice(11, 19))}</span>
           <span class="ev ${esc(d.family)}">${esc(d.event)}</span>
-          ${badge(d)}${d.retry ? ' <span class="warn">↻ retry</span>' : ''}
+          ${badge(d)}${d.retry ? ` <span class="warn">${tt('deliveries.retry')}</span>` : ''}
           <span class="mono dim right">${d.bytes} B</span>
         </summary>
         <div class="body">
@@ -528,30 +529,49 @@ app.get('/', (_req, res) => {
                 `<tr><td class="mono dim">${esc(k)}</td><td class="mono brk">${esc(v)}</td></tr>`,
             )
             .join('')}</table>
-          <pre class="mono">${esc(d.pretty)}${d.truncated ? '\n… truncated' : ''}</pre>
+          <pre class="mono">${esc(d.pretty)}${d.truncated ? `\n${tt('deliveries.truncated')}` : ''}</pre>
         </div>
       </details>`,
         )
         .join('')
-    : `<p class="dim pad">Nothing yet — deliveries appear here and in the console.</p>`;
+    : `<p class="dim pad">${tt('deliveries.empty')}</p>`;
 
   // ── the two inputs both send-side panels need ──────────────────────────────
   // Repeated rather than hoisted into a global bar, so each panel stands alone
   // and can be read as a complete example. The values are kept in the tab's
   // sessionStorage and mirrored between panels by the script below.
-  const keyField = (id) => `<label class="f"><span>signing key ${
+  const keyField = (id) => `<label class="f"><span>${tt('field.signingKey')} ${
     s.sender.hasSigningKey
-      ? `<span class="dim">— blank uses <code>PYLOT_SIGNING_SECRET</code> from <code>.env</code> (<code>${esc(s.sender.signingKeyHint)}</code>)</span>`
-      : `<span class="warn">— required: there is none in <code>.env</code></span>`
+      ? tt('field.signingKeyEnv', { hint: esc(s.sender.signingKeyHint) })
+      : tt('field.signingKeyRequired')
   }</span>
       <span class="row tight">
         <input class="k mono" id="${id}" type="password" autocomplete="off" spellcheck="false" placeholder="pwhsec_…">
-        <button type="button" class="ghost reveal" data-for="${id}">show</button>
-        <button type="button" class="ghost forget">forget</button>
+        <button type="button" class="ghost reveal" data-for="${id}">${tt('field.show')}</button>
+        <button type="button" class="ghost forget">${tt('field.forget')}</button>
       </span></label>`;
 
-  const urlField = (id) => `<label class="f"><span>API base <span class="dim">— <code>/rooms/messages</code> is appended</span></span>
+  const urlField = (id) => `<label class="f"><span>${tt('field.apiBase')} ${tt('field.apiBaseHint')}</span>
       <input class="u mono" id="${id}" spellcheck="false" placeholder="${esc(s.sender.apiUrl)}"></label>`;
+
+  // The subset of copy the browser script builds at runtime. Everything else on
+  // this page is already rendered server-side in the right language, so only
+  // these travel. `<` is escaped because this lands inside a <script> block and
+  // a literal `</script>` in any value would end it early.
+  const CLIENT_KEYS = [
+    'field.show', 'field.hide',
+    'key.signedWithTyped', 'key.signedWithEnv',
+    'send.pending', 'send.queued', 'send.queuedHint', 'send.failed403Hint',
+    'send.trace', 'send.url', 'send.clockSkew', 'send.ageAtServer',
+    'send.bodySent', 'send.curlRepro', 'send.response',
+    'sign.pending', 'sign.ok', 'sign.okCaveats', 'sign.age', 'sign.ageExpired',
+    'sign.ageInside', 'sign.bodyBytes', 'sign.bodyLabel', 'sign.signedLabel',
+    'sign.target', 'sign.signedBytesCaption', 'sign.compactDiffers',
+    'sign.alreadyCompact', 'sign.curlReproSigned',
+  ];
+  const clientStrings = JSON.stringify(
+    Object.fromEntries(CLIENT_KEYS.map((key) => [key, tt(key)])),
+  ).replace(/</g, '\\u003c');
 
   // Pretty-printed on purpose: it makes the Signature panel's "these bytes vs.
   // the compact ones" comparison show a real difference on first load.
@@ -565,9 +585,9 @@ app.get('/', (_req, res) => {
   );
 
   res.type('html').send(`<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+<html lang="${locale}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pylot messaging playground</title>
+<title>${tt('page.title')}</title>
 <style>
   :root {
     --bg:#fbfaf7; --fg:#1c1b19; --dim:#6b6862; --card:#fff; --line:#e6e2da;
@@ -643,55 +663,59 @@ app.get('/', (_req, res) => {
   .stat b { display:block; font-size:1.5rem; font-weight:600; }
   .stat span { color:var(--dim); font-size:.8rem; }
   a { color:var(--accent); }
+  .top { display:flex; align-items:flex-start; gap:1rem; }
+  .top h1 { flex:1 1 auto; }
+  a.lang { flex:0 0 auto; font-size:.82rem; color:var(--dim); text-decoration:none;
+           border:1px solid var(--line); border-radius:999px; padding:.3rem .7rem; }
+  a.lang:hover { border-color:var(--accent); color:var(--accent); }
 </style></head><body><main>
 
-  <h1>Pylot messaging playground</h1>
-  <p class="sub">Send a signed message, watch the deliveries it causes arrive.</p>
+  <div class="top">
+    <h1>${tt('page.title')}</h1>
+    <a class="lang" href="?lang=${other}" hreflang="${other}">${tt('lang.switchTo')}</a>
+  </div>
+  <p class="sub">${tt('page.subtitle')}</p>
 
   <div class="card url">
     ${
       s.endpoint
-        ? `<code id="u">${esc(s.endpoint)}</code><button onclick="navigator.clipboard.writeText(document.getElementById('u').textContent)">Copy</button><span class="dim">← paste into <em>Create subscription</em></span>`
-        : `<code id="u">${esc(s.localEndpoint)}</code><button onclick="navigator.clipboard.writeText(document.getElementById('u').textContent)">Copy</button><span class="warn">local only — not reachable from the platform</span>`
+        ? `<code id="u">${esc(s.endpoint)}</code><button onclick="navigator.clipboard.writeText(document.getElementById('u').textContent)">${tt('page.copy')}</button><span class="dim">${tt('page.pasteInto')}</span>`
+        : `<code id="u">${esc(s.localEndpoint)}</code><button onclick="navigator.clipboard.writeText(document.getElementById('u').textContent)">${tt('page.copy')}</button><span class="warn">${tt('page.localOnly')}</span>`
     }
   </div>
 
   ${
     todo.length
-      ? `<h2>Next steps</h2><div class="card"><ol>${todo.map((t) => `<li>${t}</li>`).join('')}</ol></div>`
+      ? `<h2>${tt('page.nextSteps')}</h2><div class="card"><ol>${todo.map((item) => `<li>${item}</li>`).join('')}</ol></div>`
       : ''
   }
 
   <nav class="tabs" id="tabs">
-    <button type="button" data-tab="send">Send a message</button>
-    <button type="button" data-tab="sign">Signature</button>
-    <button type="button" data-tab="deliveries">Deliveries<span class="pill" id="t-pill" hidden></span></button>
-    <button type="button" data-tab="setup">Setup</button>
+    <button type="button" data-tab="send">${tt('tab.send')}</button>
+    <button type="button" data-tab="sign">${tt('tab.sign')}</button>
+    <button type="button" data-tab="deliveries">${tt('tab.deliveries')}<span class="pill" id="t-pill" hidden></span></button>
+    <button type="button" data-tab="setup">${tt('tab.setup')}</button>
   </nav>
 
   <section class="tab" id="tab-send" hidden>
     <div class="card">
       ${
         s.sender.signingKeySuspect
-          ? `<p class="bad" style="margin:0 0 .8rem"><strong>The <code>PYLOT_SIGNING_SECRET</code> in <code>.env</code> doesn't look like a real key</strong> — expected <code>pwhsec_</code> + 64 hex. Paste a real one below; it wins over <code>.env</code>.</p>`
+          ? `<p class="bad" style="margin:0 0 .8rem">${tt('send.suspectKey')}</p>`
           : ''
       }
-      <p class="dim small" style="margin:0 0 .9rem">
-        Signed with the team key — no api key, no token. The key is used to sign this
-        one request and then forgotten: nothing is written to <code>.env</code>, and it
-        goes no further than this process. The browser only ever sees the signature.
-      </p>
+      <p class="dim small" style="margin:0 0 .9rem">${tt('send.blurb')}</p>
       ${keyField('s-key')}
       ${urlField('s-url')}
-      <label class="f"><span>roomId</span><input id="f-room" value="${esc(s.sender.roomId)}" placeholder="664f0f1e2c9a4b0012ab34cd"></label>
-      <label class="f"><span>message</span><textarea id="f-text">Hello from the receiver 👋</textarea></label>
+      <label class="f"><span>${tt('send.roomId')}</span><input id="f-room" value="${esc(s.sender.roomId)}" placeholder="664f0f1e2c9a4b0012ab34cd"></label>
+      <label class="f"><span>${tt('send.message')}</span><textarea id="f-text">${esc(tt('send.defaultText'))}</textarea></label>
       <details style="margin:0 0 .8rem">
-        <summary class="dim" style="cursor:pointer;font-size:.85rem">Raw body (overrides the fields above)</summary>
+        <summary class="dim" style="cursor:pointer;font-size:.85rem">${tt('send.rawBody')}</summary>
         <textarea id="f-body" style="margin-top:.5rem" class="mono" placeholder='{"roomId":"…","message":{"type":"text","text":{"value":"hi"}}}'></textarea>
       </details>
       <div class="row">
-        <button id="f-send">Send signed</button>
-        <span class="dim small">the resulting <code>message.sent</code> delivery lands under <em>Deliveries</em></span>
+        <button id="f-send">${tt('send.button')}</button>
+        <span class="dim small">${tt('send.buttonHint')}</span>
       </div>
       <div class="send-out" id="f-out"></div>
     </div>
@@ -699,21 +723,20 @@ app.get('/', (_req, res) => {
 
   <section class="tab" id="tab-sign" hidden>
     <div class="card">
-      <p style="margin:0 0 .7rem">Body + signing key → signature. <strong>Nothing is sent.</strong> Use this
-        to check a signature your own code produced, or to get a <code>curl</code> that reproduces the request byte for byte.</p>
+      <p style="margin:0 0 .7rem">${tt('sign.blurb')}</p>
       <pre class="mono dim wrap" style="margin:0 0 1rem">x-pylot-timestamp: &lt;unix seconds&gt;
 x-pylot-signature: sha256=hex(HMAC_SHA256(key, timestamp + "." + body))</pre>
       ${keyField('g-key')}
       ${urlField('g-url')}
-      <label class="f"><span>body <span class="dim">— hashed exactly as typed, whitespace and key order included</span></span><textarea id="g-body" class="mono" style="min-height:7rem">${esc(exampleBody)}</textarea></label>
-      <label class="f"><span>timestamp <span class="dim">— unix seconds; blank means now. Back-date it past ±${s.sender.sendTolerance}s to see the replay window bite.</span></span>
+      <label class="f"><span>${tt('sign.body')} ${tt('sign.bodyHint')}</span><textarea id="g-body" class="mono" style="min-height:7rem">${esc(exampleBody)}</textarea></label>
+      <label class="f"><span>${tt('sign.timestamp')} ${tt('sign.timestampHint', { tolerance: s.sender.sendTolerance })}</span>
         <span class="row tight">
-          <input id="g-ts" class="mono" spellcheck="false" placeholder="now">
-          <button type="button" class="ghost" id="g-stale">−10 min</button>
+          <input id="g-ts" class="mono" spellcheck="false" placeholder="${tt('sign.now')}">
+          <button type="button" class="ghost" id="g-stale">${tt('sign.stale')}</button>
         </span></label>
       <div class="row">
-        <button id="g-go">Compute signature</button>
-        <span class="dim small">no request is made — this only does the arithmetic</span>
+        <button id="g-go">${tt('sign.button')}</button>
+        <span class="dim small">${tt('sign.buttonHint')}</span>
       </div>
       <div class="send-out" id="g-out"></div>
     </div>
@@ -722,45 +745,59 @@ x-pylot-signature: sha256=hex(HMAC_SHA256(key, timestamp + "." + body))</pre>
   <section class="tab" id="tab-deliveries" hidden>
     <div class="card">
       <p class="stats">
-        <span class="stat"><b>${s.total}</b><span>received</span></span>
+        <span class="stat"><b>${s.total}</b><span>${tt('deliveries.received')}</span></span>
         <span class="stat"><b class="${s.secretSuspect ? 'bad' : s.hasSecret ? 'ok' : 'warn'}">${
-          s.secretSuspect ? 'bad key' : s.hasSecret ? 'on' : 'off'
-        }</b><span>verification</span></span>
-        <span class="stat"><b>±${s.tolerance}s</b><span>tolerance</span></span>
-        <span class="stat"><b class="${s.rejectInvalid ? 'bad' : ''}">${s.rejectInvalid ? '401' : '200'}</b><span>reply on bad sig</span></span>
+          s.secretSuspect
+            ? tt('deliveries.verificationBadKey')
+            : s.hasSecret
+              ? tt('deliveries.verificationOn')
+              : tt('deliveries.verificationOff')
+        }</b><span>${tt('deliveries.verification')}</span></span>
+        <span class="stat"><b>±${s.tolerance}s</b><span>${tt('deliveries.tolerance')}</span></span>
+        <span class="stat"><b class="${s.rejectInvalid ? 'bad' : ''}">${s.rejectInvalid ? '401' : '200'}</b><span>${tt('deliveries.replyOnBadSig')}</span></span>
       </p>
     </div>
-    <h2>Recent deliveries</h2>
+    <h2>${tt('deliveries.recent')}</h2>
     <div class="card" style="padding:.15rem .6rem">${rows}</div>
   </section>
 
   <section class="tab" id="tab-setup" hidden>
     <div class="card">
       <p class="small" style="margin:0 0 .8rem">
-        config: ${s.envFileLoaded ? `<code>.env</code> loaded` : `no <code>.env</code>`} from <code>${esc(s.envDir)}</code>
-        ${s.secretHint ? ` · subscription secret <code>${esc(s.secretHint)}</code>` : ''}
-        ${s.sender.signingKeyHint ? ` · signing key <code>${esc(s.sender.signingKeyHint)}</code>` : ' · no signing key in <code>.env</code>'}
-        · sending to <code>${esc(s.sender.apiUrl)}</code>
+        ${s.envFileLoaded ? tt('setup.configLoaded', { dir: esc(s.envDir) }) : tt('setup.configNone', { dir: esc(s.envDir) })}
+        ${s.secretHint ? tt('setup.subscriptionSecret', { hint: esc(s.secretHint) }) : ''}
+        ${s.sender.signingKeyHint ? tt('setup.signingKey', { hint: esc(s.sender.signingKeyHint) }) : tt('setup.noSigningKey')}
+        ${tt('setup.sendingTo', { url: esc(s.sender.apiUrl) })}
       </p>
-      <p style="margin:0 0 .6rem">Edit <code>.env</code> in <code>${esc(s.envDir)}</code>, then restart:</p>
-      <pre class="mono dim wrap" style="margin:0">WEBSUITE_WEBHOOK_SECRET=pwhsec_…   # from Create subscription, shown once
-NGROK_AUTHTOKEN=…                  # free, for a public URL
-NGROK_DOMAIN=…                     # optional: stable URL across restarts
+      <p style="margin:0 0 .6rem">${tt('setup.editEnv', { dir: esc(s.envDir) })}</p>
+      <pre class="mono dim wrap" style="margin:0">WEBSUITE_WEBHOOK_SECRET=pwhsec_…   # ${tt('setup.envSecret')}
+NGROK_AUTHTOKEN=…                  # ${tt('setup.envNgrokToken')}
+NGROK_DOMAIN=…                     # ${tt('setup.envNgrokDomain')}
 PYLOT_API_URL=${esc(DEFAULT_API_URL)}
-PYLOT_SIGNING_SECRET=pwhsec_…      # optional here — the Send tab takes one too
+PYLOT_SIGNING_SECRET=pwhsec_…      # ${tt('setup.envSigningKey')}
 PORT=${PORT}
-REJECT_INVALID=1                   # reply 401 on a bad signature, to see retries</pre>
-      <p class="dim small" style="margin:.9rem 0 0">
-        Only <code>WEBSUITE_WEBHOOK_SECRET</code> needs a restart to take effect —
-        it verifies inbound deliveries. The signing key and the API base can be typed
-        into the send-side tabs instead, which is the faster loop when you are testing
-        against more than one team or environment.
-      </p>
+REJECT_INVALID=1                   # ${tt('setup.envRejectInvalid')}</pre>
+      <p class="dim small" style="margin:.9rem 0 0">${tt('setup.restartNote')}</p>
     </div>
   </section>
 
 <script>
   const esc = (v) => String(v).replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+  // ── i18n ───────────────────────────────────────────────────────────────────
+  // Only the strings this script builds at runtime — everything else on this
+  // page was already rendered in the right language by the server. tr() mirrors
+  // the server's brace interpolation so one dictionary format covers both.
+  // NOTE: no backticks anywhere in this script block — it lives inside the
+  // page's own template literal, so one would end it early.
+  const T = ${clientStrings};
+  const tr = (key, params) => {
+    const raw = T[key] || key;
+    return params
+      ? raw.replace(/\{(\w+)\}/g, (whole, name) =>
+          Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : whole)
+      : raw;
+  };
 
   // ── tabs ───────────────────────────────────────────────────────────────────
   // One panel at a time, remembered per tab so the reload below doesn't dump you
@@ -811,14 +848,14 @@ REJECT_INVALID=1                   # reply 401 on a bad signature, to see retrie
       const input = document.getElementById(b.dataset.for);
       const masked = input.type === 'password';
       input.type = masked ? 'text' : 'password';
-      b.textContent = masked ? 'hide' : 'show';
+      b.textContent = masked ? tr('field.hide') : tr('field.show');
     });
   });
   document.querySelectorAll('button.forget').forEach((b) => {
     b.addEventListener('click', () => {
       try { sessionStorage.removeItem('pylot.signingKey'); } catch {}
       document.querySelectorAll('input.k').forEach((i) => { i.value = ''; i.type = 'password'; });
-      document.querySelectorAll('button.reveal').forEach((r) => { r.textContent = 'show'; });
+      document.querySelectorAll('button.reveal').forEach((r) => { r.textContent = tr('field.show'); });
     });
   });
 
@@ -836,8 +873,10 @@ REJECT_INVALID=1                   # reply 401 on a bad signature, to see retrie
   const block = (caption, text) =>
     '<p class="cap">' + esc(caption) + '</p><pre class="mono wrap">' + esc(text) + '</pre>';
   const keyLine = (r) =>
-    '<p class="cap" style="margin-top:.7rem">signed with ' + esc(r.keyHint || '?') +
-    (r.keySource === 'ui' ? ' (typed above)' : ' (PYLOT_SIGNING_SECRET)') + '</p>';
+    '<p class="cap" style="margin-top:.7rem">' +
+    esc(tr(r.keySource === 'ui' ? 'key.signedWithTyped' : 'key.signedWithEnv',
+           { hint: r.keyHint || '?' })) +
+    '</p>';
 
   async function post(url, payload, out, pending) {
     out.innerHTML = '<p class="dim">' + pending + '</p>';
@@ -872,32 +911,37 @@ REJECT_INVALID=1                   # reply 401 on a bad signature, to see retrie
       roomId: document.getElementById('f-room').value.trim(),
       text: document.getElementById('f-text').value,
       body: document.getElementById('f-body').value,
-    }, sendOut, 'Signing and sending…');
+    }, sendOut, tr('send.pending'));
     sendBtn.disabled = false;
     if (!r) { return; }
 
     const d = (r.response && r.response.data) || {};
     const head = r.ok
-      ? '<p class="verdict ok">✔ ' + r.status + ' queued — room ' + esc(d.roomId || '?') +
-        ', message ' + esc(d.messageId || '?') + '</p>' +
-        '<p class="dim small" style="margin:0">Accepted by the room pipeline — not yet delivered to the customer.</p>'
+      ? '<p class="verdict ok">' +
+        esc(tr('send.queued', {
+          status: r.status,
+          roomId: d.roomId || '?',
+          messageId: d.messageId || '?',
+        })) + '</p>' +
+        '<p class="dim small" style="margin:0">' + esc(tr('send.queuedHint')) + '</p>'
       : '<p class="verdict bad">✘ ' + r.status + ' ' + esc((r.response && r.response.msg) || '') + '</p>' +
         (r.status === 403
-          ? '<p class="dim small" style="margin:0">The platform will not say which half of the signature was wrong. Likely causes:</p>'
+          ? '<p class="dim small" style="margin:0">' + esc(tr('send.failed403Hint')) + '</p>'
           : '');
 
     const trace =
-      '<details style="margin-top:.8rem"><summary class="dim" style="cursor:pointer;font-size:.85rem">Signature trace</summary>' +
+      '<details style="margin-top:.8rem"><summary class="dim" style="cursor:pointer;font-size:.85rem">' +
+      esc(tr('send.trace')) + '</summary>' +
       '<div style="margin-top:.5rem">' +
       rowsOf(Object.entries(r.request.headers).concat([
-        ['url', r.request.url],
-        ['clock skew', r.skew === null ? '' : r.skew + 's'],
-        ['age at server', r.requestAge === null ? '' : r.requestAge + 's'],
+        [tr('send.url'), r.request.url],
+        [tr('send.clockSkew'), r.skew === null ? '' : r.skew + 's'],
+        [tr('send.ageAtServer'), r.requestAge === null ? '' : r.requestAge + 's'],
       ])) +
-      block('signed bytes — HMAC-SHA256 over exactly this', JSON.stringify(r.request.signedContent)) +
-      block('body sent', r.request.rawBody) +
-      block('curl repro', r.request.curl) +
-      block('response', JSON.stringify(r.response, null, 2)) +
+      block(tr('sign.signedBytesCaption'), JSON.stringify(r.request.signedContent)) +
+      block(tr('send.bodySent'), r.request.rawBody) +
+      block(tr('send.curlRepro'), r.request.curl) +
+      block(tr('send.response'), JSON.stringify(r.response, null, 2)) +
       '</div></details>';
 
     sendOut.innerHTML = head + notesOf(r.notes) + keyLine(r) + trace;
@@ -919,39 +963,42 @@ REJECT_INVALID=1                   # reply 401 on a bad signature, to see retrie
       apiUrl: readUrl(),
       body: document.getElementById('g-body').value,
       timestamp: signTs.value,
-    }, signOut, 'Hashing…');
+    }, signOut, tr('sign.pending'));
     signBtn.disabled = false;
     if (!r) { return; }
 
     const head =
       '<p class="verdict ' + (r.warnings.length ? 'warn' : 'ok') + '">' +
-      (r.warnings.length ? '⚠ signature computed, with caveats' : '✔ signature computed') +
+      esc(r.warnings.length ? tr('sign.okCaveats') : tr('sign.ok')) +
       '</p>';
 
     const summary = rowsOf([
       ['x-pylot-timestamp', r.timestamp],
       ['x-pylot-signature', r.signature],
-      ['age', r.age + 's' + (r.expired ? ' — expired (±' + r.tolerance + 's)' : ' — inside the ±' + r.tolerance + 's window')],
-      ['body', r.bodyBytes + ' bytes'],
-      ['signed', r.signedBytes + ' bytes'],
-      ['target', r.url],
+      [tr('sign.age'), tr(r.expired ? 'sign.ageExpired' : 'sign.ageInside',
+                          { age: r.age, tolerance: r.tolerance })],
+      [tr('sign.bodyLabel'), tr('sign.bodyBytes', { bytes: r.bodyBytes })],
+      [tr('sign.signedLabel'), tr('sign.bodyBytes', { bytes: r.signedBytes })],
+      [tr('sign.target'), r.url],
     ]);
 
     const compare = r.compact
       ? (r.compact.differs
           ? block(
-              'the same body, compact — different bytes, so a different digest (' +
-                r.compact.digest.slice(0, 16) + '… vs ' + r.digest.slice(0, 16) + '…)',
+              tr('sign.compactDiffers', {
+                compactDigest: r.compact.digest.slice(0, 16),
+                digest: r.digest.slice(0, 16),
+              }),
               r.compact.rawBody)
-          : '<p class="cap">already compact — re-serializing it changes nothing, so any client sends the bytes this digest covers.</p>')
+          : '<p class="cap">' + esc(tr('sign.alreadyCompact')) + '</p>')
       : '';
 
     signOut.innerHTML =
       head + notesOf(r.warnings) + keyLine(r) +
       '<div style="margin-top:.7rem">' + summary +
-      block('signed bytes — HMAC-SHA256 over exactly this', JSON.stringify(r.signedContent)) +
+      block(tr('sign.signedBytesCaption'), JSON.stringify(r.signedContent)) +
       compare +
-      block('curl repro — sends the bytes that were hashed', r.curl) +
+      block(tr('sign.curlReproSigned'), r.curl) +
       '</div>';
   });
 

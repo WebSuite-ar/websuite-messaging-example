@@ -80,6 +80,13 @@ sit at the top; everything else is behind a tab, so you get one thing at a time:
 | **Deliveries** | the last 25 deliveries, headers and payloads expandable. Counts new arrivals on the tab rather than reloading under you |
 | **Setup** | where config came from, and what to put in `.env` |
 
+The page is bilingual. It opens in the language your browser asks for
+(`Accept-Language`, q-values respected), so `es-AR` gets Spanish and everything
+else falls back to English. The link in the top-right switches it; the choice is
+remembered in a `pylot.lang` cookie, and `?lang=es` / `?lang=en` forces one for
+a shareable URL. The diagnostics from the Send and Signature tabs follow the
+same language. The **CLI stays English** whatever the browser says.
+
 The **signing key** and **API base** are fields in the send-side tabs, not just
 `.env` values. A key typed there wins over `.env`, is used to sign that one
 request and then forgotten — nothing is written to disk, and it never reaches

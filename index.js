@@ -19,7 +19,15 @@ const path = require('path');
 const express = require('express');
 
 const { diagnose } = require('./diagnose');
-const { signedHeaders, looksLikeSecret } = require('./sign');
+const {
+  signRequest,
+  signedHeaders,
+  looksLikeSecret,
+  // The window the platform enforces on OUTBOUND signatures. Distinct from
+  // `TOLERANCE_SECONDS` below, which is this receiver's own leniency for
+  // inbound deliveries and is configurable.
+  TOLERANCE_SECONDS: SEND_TOLERANCE,
+} = require('./sign');
 const { bold, dim, red, green, yellow, cyan, magenta, line } = require('./tty');
 
 // Load `.env` from THIS directory (not the cwd) before anything reads
@@ -57,9 +65,45 @@ const SECRET_SUSPECT = Boolean(SECRET) && !looksLikeSecret(SECRET);
 // is the TEAM SIGNING KEY and authenticates what we send Pylot. Both are
 // `pwhsec_…`, neither verifies the other, and conflating them is the classic
 // way to spend an afternoon on an unexplained 403.
-const API_URL = (process.env.PYLOT_API_URL || 'http://localhost:4000/api/v2').replace(/\/+$/, '');
+// The platform, unless `.env` or the UI says otherwise. `/api/v2` is part of it:
+// the endpoint is POST /api/v2/rooms/messages, and the code appends the rest.
+const DEFAULT_API_URL = 'https://api.websuite.ar/api/v2';
+const API_URL = (process.env.PYLOT_API_URL || DEFAULT_API_URL).replace(/\/+$/, '');
 const SIGNING_SECRET = process.env.PYLOT_SIGNING_SECRET || '';
 const ROOM_ID = process.env.PYLOT_ROOM_ID || '';
+
+/** First 11 chars — `pwhsec_` plus a little — enough to tell two keys apart. */
+const keyHint = (secret) => (secret ? String(secret).slice(0, 11) + '\u2026' : null);
+
+/**
+ * Which key signs this request: whatever the UI pasted in, else `.env`.
+ *
+ * A pasted key is used for the one request and then forgotten — not written to
+ * `.env`, not kept in module state — so the CLI and the next request still see
+ * the environment's key. That keeps `.env` optional without making the browser
+ * the source of truth for a credential that can send as the whole team.
+ */
+function resolveSigningKey(supplied) {
+  const fromUi = typeof supplied === 'string' ? supplied.trim() : '';
+  if (fromUi) {
+    return { secret: fromUi, source: 'ui' };
+  }
+  return { secret: SIGNING_SECRET, source: SIGNING_SECRET ? 'env' : 'none' };
+}
+
+/** Same deal for the target: whatever the UI typed, else `.env`, else the default. */
+function resolveApiUrl(supplied) {
+  const fromUi = typeof supplied === 'string' ? supplied.trim() : '';
+  return (fromUi || API_URL).replace(/\/+$/, '');
+}
+
+/** A copy-pasteable curl that reproduces a request byte for byte. */
+function asCurl(url, headers, rawBody) {
+  const h = Object.entries(headers)
+    .map(([k, v]) => `  -H ${JSON.stringify(`${k}: ${v}`)}`)
+    .join(' \\\n');
+  return `curl -sS -X POST ${JSON.stringify(url)} \\\n${h} \\\n  --data-raw ${JSON.stringify(rawBody)}`;
+}
 
 /** Colour an event type by family so the stream is skimmable. */
 function paintEvent(type) {
@@ -186,8 +230,9 @@ function snapshot() {
       apiUrl: API_URL,
       hasSigningKey: Boolean(SIGNING_SECRET),
       signingKeySuspect: Boolean(SIGNING_SECRET) && !looksLikeSecret(SIGNING_SECRET),
-      signingKeyHint: SIGNING_SECRET ? SIGNING_SECRET.slice(0, 11) + '…' : null,
+      signingKeyHint: keyHint(SIGNING_SECRET),
       roomId: ROOM_ID,
+      sendTolerance: SEND_TOLERANCE,
     },
   };
 }
@@ -205,6 +250,17 @@ function snapshot() {
  */
 app.post('/_send', async (req, res) => {
   const { roomId, userConnectionId, transportId, text, body: overrideBody } = req.body || {};
+
+  // The key can come from the panel instead of `.env` — see resolveSigningKey.
+  const { secret, source: keySource } = resolveSigningKey(req.body && req.body.signingKey);
+  const apiUrl = resolveApiUrl(req.body && req.body.apiUrl);
+  if (!secret) {
+    res.status(400).json({
+      error:
+        'No signing key. Paste one into the Signing key field, or set PYLOT_SIGNING_SECRET in .env — get it from GET /rooms/signing-key or `node send.js --provision`.',
+    });
+    return;
+  }
 
   let payload;
   if (typeof overrideBody === 'string' && overrideBody.trim()) {
@@ -233,8 +289,8 @@ app.post('/_send', async (req, res) => {
   // Serialize ONCE. This exact string is hashed and then sent; the scheme rests
   // on those being the same bytes.
   const rawBody = JSON.stringify(payload);
-  const { headers, signedContent, timestamp } = signedHeaders(rawBody, SIGNING_SECRET);
-  const url = `${API_URL}/rooms/messages`;
+  const { headers, signedContent, timestamp } = signedHeaders(rawBody, secret);
+  const url = `${apiUrl}/rooms/messages`;
 
   let upstream;
   let responseText = '';
@@ -244,7 +300,9 @@ app.post('/_send', async (req, res) => {
   } catch (err) {
     res.status(502).json({
       error: `could not reach ${url} — ${err.message}`,
-      request: { url, headers, rawBody, signedContent },
+      request: { url, headers, rawBody, signedContent, curl: asCurl(url, headers, rawBody) },
+      keySource,
+      keyHint: keyHint(secret),
     });
     return;
   }
@@ -268,7 +326,7 @@ app.post('/_send', async (req, res) => {
     ? []
     : diagnose({
         status: upstream.status,
-        secret: SIGNING_SECRET,
+        secret,
         skew,
         requestAge,
         signedContent,
@@ -290,12 +348,118 @@ app.post('/_send', async (req, res) => {
   res.status(200).json({
     ok: Boolean(ok),
     status: upstream.status,
-    // The secret itself never appears here — only the signature derived from it.
-    request: { url, headers, rawBody, signedContent },
+    // The secret itself never appears here — only the signature derived from it,
+    // and enough of a hint to tell two keys apart.
+    request: { url, headers, rawBody, signedContent, curl: asCurl(url, headers, rawBody) },
+    keySource,
+    keyHint: keyHint(secret),
     response: parsed ?? responseText,
     skew,
     requestAge,
     notes,
+  });
+});
+
+// ------------------------------------------------------------------ signing
+/**
+ * Body + signing key → signature, and nothing else. No request is made.
+ *
+ * The counterpart to `/_send` for when the question is "is my signature right?"
+ * rather than "did the message land". It hashes the body EXACTLY as typed —
+ * whitespace, key order, unicode escaping and all — and, when the body parses
+ * as JSON, also reports the digest of its compact re-serialization, because the
+ * two differing is the single most common cause of a 403 nobody can explain.
+ */
+app.post('/_sign', (req, res) => {
+  const { body: input, timestamp: tsInput } = req.body || {};
+  const { secret, source: keySource } = resolveSigningKey(req.body && req.body.signingKey);
+  const apiUrl = resolveApiUrl(req.body && req.body.apiUrl);
+
+  const rawBody = typeof input === 'string' ? input : '';
+  if (!rawBody.trim()) {
+    res.status(400).json({ error: 'Nothing to sign — paste the request body you intend to send.' });
+    return;
+  }
+  if (!secret) {
+    res.status(400).json({
+      error: 'No signing key. Paste one above, or set PYLOT_SIGNING_SECRET in .env.',
+    });
+    return;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  let seconds = now;
+  const tsRaw = tsInput === undefined || tsInput === null ? '' : String(tsInput).trim();
+  if (tsRaw) {
+    const n = Number(tsRaw);
+    if (!Number.isFinite(n)) {
+      res.status(400).json({ error: `\`${tsRaw}\` is not unix seconds. Leave it blank for now.` });
+      return;
+    }
+    seconds = Math.floor(n);
+  }
+
+  const { headers, signedContent, digest, timestamp } = signedHeaders(rawBody, secret, seconds);
+  const url = `${apiUrl}/rooms/messages`;
+
+  // The same body, re-serialized compactly: different bytes, different digest.
+  // Showing both side by side is what makes "serialize once" concrete.
+  let compact = null;
+  let jsonError = null;
+  try {
+    const reserialized = JSON.stringify(JSON.parse(rawBody));
+    compact = {
+      rawBody: reserialized,
+      digest: signRequest(reserialized, secret, seconds).digest,
+      differs: reserialized !== rawBody,
+    };
+  } catch (err) {
+    jsonError = err.message;
+  }
+
+  const age = now - seconds;
+  const expired = Math.abs(age) > SEND_TOLERANCE;
+
+  const warnings = [];
+  if (!looksLikeSecret(secret)) {
+    warnings.push(
+      'That key does not look real — expected `pwhsec_` + 64 hex chars. The digest below is still arithmetically correct; the platform will simply 403 it.',
+    );
+  }
+  if (jsonError) {
+    warnings.push(
+      `The body is not valid JSON (${jsonError}). It was signed anyway, byte for byte — but POST /rooms/messages answers 400 before the signature matters.`,
+    );
+  }
+  if (compact && compact.differs) {
+    warnings.push(
+      'This body is not compact, so any client that re-serializes it (a JSON.parse → JSON.stringify round trip, most HTTP libraries given an object) puts different bytes on the wire than the ones hashed here. Send exactly these bytes, or sign the compact form shown below.',
+    );
+  }
+  if (expired) {
+    warnings.push(
+      `The timestamp is ${age}s old, outside the ±${SEND_TOLERANCE}s replay window — this signature is already expired and gets a 403 however correct the digest is.`,
+    );
+  }
+
+  res.status(200).json({
+    keySource,
+    keyHint: keyHint(secret),
+    keyLooksReal: looksLikeSecret(secret),
+    url,
+    timestamp,
+    age,
+    expired,
+    tolerance: SEND_TOLERANCE,
+    digest,
+    signature: headers['x-pylot-signature'],
+    headers,
+    signedContent,
+    signedBytes: Buffer.byteLength(signedContent, 'utf8'),
+    bodyBytes: Buffer.byteLength(rawBody, 'utf8'),
+    compact,
+    curl: asCurl(url, headers, rawBody),
+    warnings,
   });
 });
 
@@ -327,7 +491,7 @@ app.get('/', (_req, res) => {
     );
   }
   if (!s.envFileLoaded) {
-    todo.push(`No <code>.env</code> found in <code>${esc(s.envDir)}</code> — copy <code>.env.example</code> to <code>.env</code>. Exported shell vars work too.`);
+    todo.push(`No <code>.env</code> found in <code>${esc(s.envDir)}</code> — copy <code>.env.example</code> to <code>.env</code>. Exported shell vars work too. Sending works without it: paste the key into the <em>Send</em> tab.`);
   }
   if (s.endpoint && s.hasSecret && !s.total) {
     todo.push(
@@ -371,6 +535,35 @@ app.get('/', (_req, res) => {
         .join('')
     : `<p class="dim pad">Nothing yet — deliveries appear here and in the console.</p>`;
 
+  // ── the two inputs both send-side panels need ──────────────────────────────
+  // Repeated rather than hoisted into a global bar, so each panel stands alone
+  // and can be read as a complete example. The values are kept in the tab's
+  // sessionStorage and mirrored between panels by the script below.
+  const keyField = (id) => `<label class="f"><span>signing key ${
+    s.sender.hasSigningKey
+      ? `<span class="dim">— blank uses <code>PYLOT_SIGNING_SECRET</code> from <code>.env</code> (<code>${esc(s.sender.signingKeyHint)}</code>)</span>`
+      : `<span class="warn">— required: there is none in <code>.env</code></span>`
+  }</span>
+      <span class="row tight">
+        <input class="k mono" id="${id}" type="password" autocomplete="off" spellcheck="false" placeholder="pwhsec_…">
+        <button type="button" class="ghost reveal" data-for="${id}">show</button>
+        <button type="button" class="ghost forget">forget</button>
+      </span></label>`;
+
+  const urlField = (id) => `<label class="f"><span>API base <span class="dim">— <code>/rooms/messages</code> is appended</span></span>
+      <input class="u mono" id="${id}" spellcheck="false" placeholder="${esc(s.sender.apiUrl)}"></label>`;
+
+  // Pretty-printed on purpose: it makes the Signature panel's "these bytes vs.
+  // the compact ones" comparison show a real difference on first load.
+  const exampleBody = JSON.stringify(
+    {
+      roomId: s.sender.roomId || '664f0f1e2c9a4b0012ab34cd',
+      message: { type: 'text', text: { value: 'Hello 👋' } },
+    },
+    null,
+    2,
+  );
+
   res.type('html').send(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -385,12 +578,14 @@ app.get('/', (_req, res) => {
             --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; --accent:#8ab4ff; }
   }
   * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
   body { margin:0; padding:2rem 1.25rem; background:var(--bg); color:var(--fg);
          font:15px/1.55 ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif; }
   main { max-width:820px; margin:0 auto; }
   h1 { font-size:1.35rem; margin:0 0 .25rem; }
   h2 { font-size:.8rem; text-transform:uppercase; letter-spacing:.08em;
        color:var(--dim); margin:2rem 0 .6rem; font-weight:600; }
+  h2:first-child { margin-top:0; }
   .sub { color:var(--dim); margin:0 0 1.5rem; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:1rem 1.1rem; }
   .url { display:flex; gap:.6rem; align-items:center; flex-wrap:wrap; }
@@ -398,8 +593,16 @@ app.get('/', (_req, res) => {
   button { font:inherit; padding:.35rem .7rem; border:1px solid var(--line);
            border-radius:6px; background:transparent; color:var(--fg); cursor:pointer; }
   button:hover { border-color:var(--accent); color:var(--accent); }
+  button.ghost { color:var(--dim); font-size:.82rem; padding:.3rem .55rem; }
+  nav.tabs { display:flex; gap:.4rem; flex-wrap:wrap; margin:1.7rem 0 .9rem; }
+  nav.tabs button { border-radius:999px; padding:.4rem .95rem; font-size:.9rem; }
+  nav.tabs button.on { border-color:var(--accent); color:var(--accent);
+                       background:var(--card); font-weight:600; }
+  .pill { display:inline-block; margin-left:.45rem; padding:0 .4rem; border-radius:999px;
+          background:var(--accent); color:var(--card); font-size:.72rem; font-weight:700; }
   .mono, code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
   .dim { color:var(--dim); }
+  .small { font-size:.85rem; }
   .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
   ol { padding-left:1.2rem; margin:0; } ol li { margin:.45rem 0; }
   table { width:100%; border-collapse:collapse; }
@@ -421,17 +624,21 @@ app.get('/', (_req, res) => {
   .brk { word-break:break-all; }
   pre { background:var(--bg); border:1px solid var(--line); border-radius:6px;
         padding:.7rem .8rem; overflow-x:auto; font-size:.8rem; margin:0; }
+  pre.wrap { white-space:pre-wrap; word-break:break-all; }
   .ev.message { color:var(--accent); } .ev.room { color:var(--warn); } .ev.failed { color:var(--bad); }
   input, textarea { font:inherit; width:100%; padding:.45rem .55rem; border:1px solid var(--line);
                     border-radius:6px; background:var(--bg); color:var(--fg); }
   textarea { min-height:3.2rem; resize:vertical; }
   label.f { display:block; margin:0 0 .7rem; }
-  label.f span { display:block; font-size:.78rem; color:var(--dim); margin:0 0 .25rem; }
-  .row { display:flex; gap:.7rem; align-items:center; margin-top:.2rem; }
+  label.f > span { display:block; font-size:.78rem; color:var(--dim); margin:0 0 .25rem; }
+  .row { display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; margin-top:.2rem; }
+  .row.tight { margin-top:0; }
+  .row.tight input { flex:1 1 14rem; min-width:0; }
   .send-out { margin:.9rem 0 0; }
   .send-out .verdict { font-weight:600; margin:0 0 .5rem; }
   .send-out ul { margin:.5rem 0 0; padding-left:1.1rem; font-size:.85rem; color:var(--dim); }
   .send-out li { margin:.3rem 0; }
+  .cap { font-size:.78rem; color:var(--dim); margin:.6rem 0 .2rem; }
   .stats { display:flex; gap:1.5rem; flex-wrap:wrap; margin:0; }
   .stat b { display:block; font-size:1.5rem; font-weight:600; }
   .stat span { color:var(--dim); font-size:.8rem; }
@@ -439,7 +646,7 @@ app.get('/', (_req, res) => {
 </style></head><body><main>
 
   <h1>Pylot messaging playground</h1>
-  <p class="sub">Send a signed message, watch the deliveries it causes arrive. This page refreshes itself.</p>
+  <p class="sub">Send a signed message, watch the deliveries it causes arrive.</p>
 
   <div class="card url">
     ${
@@ -455,135 +662,312 @@ app.get('/', (_req, res) => {
       : ''
   }
 
-  <h2>Status</h2>
-  <div class="card">
-    <p class="stats">
-      <span class="stat"><b>${s.total}</b><span>received</span></span>
-      <span class="stat"><b class="${s.secretSuspect ? 'bad' : s.hasSecret ? 'ok' : 'warn'}">${
-        s.secretSuspect ? 'bad key' : s.hasSecret ? 'on' : 'off'
-      }</b><span>verification</span></span>
-      <span class="stat"><b>±${s.tolerance}s</b><span>tolerance</span></span>
-      <span class="stat"><b class="${s.rejectInvalid ? 'bad' : ''}">${s.rejectInvalid ? '401' : '200'}</b><span>reply on bad sig</span></span>
-    </p>
-    <p class="dim" style="margin:.9rem 0 0;font-size:.85rem">
-      config: ${s.envFileLoaded ? `<code>.env</code> loaded` : `no <code>.env</code>`} from <code>${esc(s.envDir)}</code>
-      ${s.secretHint ? ` · secret <code>${esc(s.secretHint)}</code>` : ''}
-    </p>
-  </div>
+  <nav class="tabs" id="tabs">
+    <button type="button" data-tab="send">Send a message</button>
+    <button type="button" data-tab="sign">Signature</button>
+    <button type="button" data-tab="deliveries">Deliveries<span class="pill" id="t-pill" hidden></span></button>
+    <button type="button" data-tab="setup">Setup</button>
+  </nav>
 
-  <h2>Send a message</h2>
-  <div class="card">
-    ${
-      s.sender.hasSigningKey
-        ? s.sender.signingKeySuspect
-          ? `<p class="bad" style="margin:0 0 .8rem"><strong>PYLOT_SIGNING_SECRET doesn't look like a real key</strong> — expected <code>pwhsec_</code> + 64 hex. Every send will 403.</p>`
+  <section class="tab" id="tab-send" hidden>
+    <div class="card">
+      ${
+        s.sender.signingKeySuspect
+          ? `<p class="bad" style="margin:0 0 .8rem"><strong>The <code>PYLOT_SIGNING_SECRET</code> in <code>.env</code> doesn't look like a real key</strong> — expected <code>pwhsec_</code> + 64 hex. Paste a real one below; it wins over <code>.env</code>.</p>`
           : ''
-        : `<p class="warn" style="margin:0 0 .8rem">Set <code>PYLOT_SIGNING_SECRET</code> in <code>.env</code> and restart. Get it from <code>GET /rooms/signing-key</code>, or run <code>node send.js --provision</code>.</p>`
-    }
-    <p class="dim" style="margin:0 0 .9rem;font-size:.85rem">
-      Signed with the team key — no api key, no token. Posted to
-      <code>${esc(s.sender.apiUrl)}/rooms/messages</code>${
-        s.sender.signingKeyHint ? ` as <code>${esc(s.sender.signingKeyHint)}</code>` : ''
-      }. The key stays on this server; the browser only ever sees the signature.
-    </p>
-    <label class="f"><span>roomId</span><input id="f-room" value="${esc(s.sender.roomId)}" placeholder="664f0f1e2c9a4b0012ab34cd"></label>
-    <label class="f"><span>message</span><textarea id="f-text">Hello from the receiver 👋</textarea></label>
-    <details style="margin:0 0 .8rem">
-      <summary class="dim" style="cursor:pointer;font-size:.85rem">Raw body (overrides the fields above)</summary>
-      <textarea id="f-body" style="margin-top:.5rem" class="mono" placeholder='{"roomId":"…","message":{"type":"text","text":{"value":"hi"}}}'></textarea>
-    </details>
-    <div class="row">
-      <button id="f-send">Send signed</button>
-      <span class="dim" style="font-size:.85rem">the resulting <code>message.sent</code> delivery appears below</span>
+      }
+      <p class="dim small" style="margin:0 0 .9rem">
+        Signed with the team key — no api key, no token. The key is used to sign this
+        one request and then forgotten: nothing is written to <code>.env</code>, and it
+        goes no further than this process. The browser only ever sees the signature.
+      </p>
+      ${keyField('s-key')}
+      ${urlField('s-url')}
+      <label class="f"><span>roomId</span><input id="f-room" value="${esc(s.sender.roomId)}" placeholder="664f0f1e2c9a4b0012ab34cd"></label>
+      <label class="f"><span>message</span><textarea id="f-text">Hello from the receiver 👋</textarea></label>
+      <details style="margin:0 0 .8rem">
+        <summary class="dim" style="cursor:pointer;font-size:.85rem">Raw body (overrides the fields above)</summary>
+        <textarea id="f-body" style="margin-top:.5rem" class="mono" placeholder='{"roomId":"…","message":{"type":"text","text":{"value":"hi"}}}'></textarea>
+      </details>
+      <div class="row">
+        <button id="f-send">Send signed</button>
+        <span class="dim small">the resulting <code>message.sent</code> delivery lands under <em>Deliveries</em></span>
+      </div>
+      <div class="send-out" id="f-out"></div>
     </div>
-    <div class="send-out" id="f-out"></div>
-  </div>
+  </section>
 
-  <h2>Recent deliveries</h2>
-  <div class="card" style="padding:.15rem .6rem">${rows}</div>
+  <section class="tab" id="tab-sign" hidden>
+    <div class="card">
+      <p style="margin:0 0 .7rem">Body + signing key → signature. <strong>Nothing is sent.</strong> Use this
+        to check a signature your own code produced, or to get a <code>curl</code> that reproduces the request byte for byte.</p>
+      <pre class="mono dim wrap" style="margin:0 0 1rem">x-pylot-timestamp: &lt;unix seconds&gt;
+x-pylot-signature: sha256=hex(HMAC_SHA256(key, timestamp + "." + body))</pre>
+      ${keyField('g-key')}
+      ${urlField('g-url')}
+      <label class="f"><span>body <span class="dim">— hashed exactly as typed, whitespace and key order included</span></span><textarea id="g-body" class="mono" style="min-height:7rem">${esc(exampleBody)}</textarea></label>
+      <label class="f"><span>timestamp <span class="dim">— unix seconds; blank means now. Back-date it past ±${s.sender.sendTolerance}s to see the replay window bite.</span></span>
+        <span class="row tight">
+          <input id="g-ts" class="mono" spellcheck="false" placeholder="now">
+          <button type="button" class="ghost" id="g-stale">−10 min</button>
+        </span></label>
+      <div class="row">
+        <button id="g-go">Compute signature</button>
+        <span class="dim small">no request is made — this only does the arithmetic</span>
+      </div>
+      <div class="send-out" id="g-out"></div>
+    </div>
+  </section>
 
-  <h2>Configure</h2>
-  <div class="card">
-    <p style="margin:0 0 .6rem">Edit <code>.env</code> in <code>${esc(s.envDir)}</code>, then restart:</p>
-    <pre class="mono dim" style="margin:0;white-space:pre-wrap;font-size:.85rem">WEBSUITE_WEBHOOK_SECRET=pwhsec_…   # from Create subscription, shown once
+  <section class="tab" id="tab-deliveries" hidden>
+    <div class="card">
+      <p class="stats">
+        <span class="stat"><b>${s.total}</b><span>received</span></span>
+        <span class="stat"><b class="${s.secretSuspect ? 'bad' : s.hasSecret ? 'ok' : 'warn'}">${
+          s.secretSuspect ? 'bad key' : s.hasSecret ? 'on' : 'off'
+        }</b><span>verification</span></span>
+        <span class="stat"><b>±${s.tolerance}s</b><span>tolerance</span></span>
+        <span class="stat"><b class="${s.rejectInvalid ? 'bad' : ''}">${s.rejectInvalid ? '401' : '200'}</b><span>reply on bad sig</span></span>
+      </p>
+    </div>
+    <h2>Recent deliveries</h2>
+    <div class="card" style="padding:.15rem .6rem">${rows}</div>
+  </section>
+
+  <section class="tab" id="tab-setup" hidden>
+    <div class="card">
+      <p class="small" style="margin:0 0 .8rem">
+        config: ${s.envFileLoaded ? `<code>.env</code> loaded` : `no <code>.env</code>`} from <code>${esc(s.envDir)}</code>
+        ${s.secretHint ? ` · subscription secret <code>${esc(s.secretHint)}</code>` : ''}
+        ${s.sender.signingKeyHint ? ` · signing key <code>${esc(s.sender.signingKeyHint)}</code>` : ' · no signing key in <code>.env</code>'}
+        · sending to <code>${esc(s.sender.apiUrl)}</code>
+      </p>
+      <p style="margin:0 0 .6rem">Edit <code>.env</code> in <code>${esc(s.envDir)}</code>, then restart:</p>
+      <pre class="mono dim wrap" style="margin:0">WEBSUITE_WEBHOOK_SECRET=pwhsec_…   # from Create subscription, shown once
 NGROK_AUTHTOKEN=…                  # free, for a public URL
 NGROK_DOMAIN=…                     # optional: stable URL across restarts
+PYLOT_API_URL=${esc(DEFAULT_API_URL)}
+PYLOT_SIGNING_SECRET=pwhsec_…      # optional here — the Send tab takes one too
 PORT=${PORT}
 REJECT_INVALID=1                   # reply 401 on a bad signature, to see retries</pre>
-  </div>
+      <p class="dim small" style="margin:.9rem 0 0">
+        Only <code>WEBSUITE_WEBHOOK_SECRET</code> needs a restart to take effect —
+        it verifies inbound deliveries. The signing key and the API base can be typed
+        into the send-side tabs instead, which is the faster loop when you are testing
+        against more than one team or environment.
+      </p>
+    </div>
+  </section>
 
 <script>
-  // Everything the send returned, laid out so a 403 is diagnosable without
-  // leaving the page: what was signed, what was sent, and why it likely failed.
   const esc = (v) => String(v).replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-  const out = document.getElementById('f-out');
-  const btn = document.getElementById('f-send');
 
-  btn.addEventListener('click', async () => {
-    btn.disabled = true;
-    out.innerHTML = '<p class="dim">Signing and sending…</p>';
-    let r;
+  // ── tabs ───────────────────────────────────────────────────────────────────
+  // One panel at a time, remembered per tab so the reload below doesn't dump you
+  // back on the first one.
+  const tabButtons = Array.from(document.querySelectorAll('#tabs button'));
+  const pill = document.getElementById('t-pill');
+  let active = null;
+  let unseen = 0;
+
+  function show(name) {
+    active = name;
+    tabButtons.forEach((b) => b.classList.toggle('on', b.dataset.tab === name));
+    document.querySelectorAll('section.tab').forEach((sec) => {
+      sec.hidden = sec.id !== 'tab-' + name;
+    });
+    try { sessionStorage.setItem('pylot.tab', name); } catch {}
+    // The delivery list is server-rendered, so seeing the new ones means a reload.
+    if (name === 'deliveries' && unseen > 0) { location.reload(); }
+  }
+  tabButtons.forEach((b) => b.addEventListener('click', () => show(b.dataset.tab)));
+  let stored = null;
+  try { stored = sessionStorage.getItem('pylot.tab'); } catch {}
+  show(document.getElementById('tab-' + stored) ? stored : 'send');
+
+  // ── the key and the target ─────────────────────────────────────────────────
+  // Both panels share one value: type it once. It lives in this tab's
+  // sessionStorage — survives a refresh, dies with the tab, never touches disk —
+  // and is posted to THIS process, which signs. It is never sent to the platform.
+  function bind(selector, store, initial) {
+    const inputs = Array.from(document.querySelectorAll(selector));
+    let saved = null;
+    try { saved = sessionStorage.getItem(store); } catch {}
+    const value = saved === null ? initial : saved;
+    inputs.forEach((input) => {
+      input.value = value;
+      input.addEventListener('input', () => {
+        try { sessionStorage.setItem(store, input.value); } catch {}
+        inputs.forEach((other) => { if (other !== input) { other.value = input.value; } });
+      });
+    });
+    return () => (inputs.length ? inputs[0].value.trim() : '');
+  }
+  const readKey = bind('input.k', 'pylot.signingKey', '');
+  const readUrl = bind('input.u', 'pylot.apiUrl', '');
+
+  document.querySelectorAll('button.reveal').forEach((b) => {
+    b.addEventListener('click', () => {
+      const input = document.getElementById(b.dataset.for);
+      const masked = input.type === 'password';
+      input.type = masked ? 'text' : 'password';
+      b.textContent = masked ? 'hide' : 'show';
+    });
+  });
+  document.querySelectorAll('button.forget').forEach((b) => {
+    b.addEventListener('click', () => {
+      try { sessionStorage.removeItem('pylot.signingKey'); } catch {}
+      document.querySelectorAll('input.k').forEach((i) => { i.value = ''; i.type = 'password'; });
+      document.querySelectorAll('button.reveal').forEach((r) => { r.textContent = 'show'; });
+    });
+  });
+
+  // ── shared renderers ──────────────────────────────────────────────────────
+  const rowsOf = (pairs) =>
+    '<table class="hdr">' +
+    pairs.filter(([, v]) => v !== null && v !== undefined && v !== '')
+      .map(([k, v]) => '<tr><td class="mono dim">' + esc(k) + '</td><td class="mono brk">' + esc(v) + '</td></tr>')
+      .join('') +
+    '</table>';
+  const notesOf = (notes) =>
+    notes && notes.length
+      ? '<ul>' + notes.map((n) => '<li>' + esc(n) + '</li>').join('') + '</ul>'
+      : '';
+  const block = (caption, text) =>
+    '<p class="cap">' + esc(caption) + '</p><pre class="mono wrap">' + esc(text) + '</pre>';
+  const keyLine = (r) =>
+    '<p class="cap" style="margin-top:.7rem">signed with ' + esc(r.keyHint || '?') +
+    (r.keySource === 'ui' ? ' (typed above)' : ' (PYLOT_SIGNING_SECRET)') + '</p>';
+
+  async function post(url, payload, out, pending) {
+    out.innerHTML = '<p class="dim">' + pending + '</p>';
     try {
-      r = await (await fetch('/_send', {
+      const r = await (await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          roomId: document.getElementById('f-room').value.trim(),
-          text: document.getElementById('f-text').value,
-          body: document.getElementById('f-body').value,
-        }),
+        body: JSON.stringify(payload),
       })).json();
+      if (r.error) {
+        out.innerHTML = '<p class="bad">' + esc(r.error) + '</p>' + notesOf(r.notes);
+        return null;
+      }
+      return r;
     } catch (e) {
       out.innerHTML = '<p class="bad">' + esc(e.message) + '</p>';
-      btn.disabled = false;
-      return;
+      return null;
     }
-    if (r.error) {
-      out.innerHTML = '<p class="bad">' + esc(r.error) + '</p>';
-      btn.disabled = false;
-      return;
-    }
+  }
+
+  // ── send ──────────────────────────────────────────────────────────────────
+  // Everything the send returned, laid out so a 403 is diagnosable without
+  // leaving the page: what was signed, what was sent, and why it likely failed.
+  const sendOut = document.getElementById('f-out');
+  const sendBtn = document.getElementById('f-send');
+
+  sendBtn.addEventListener('click', async () => {
+    sendBtn.disabled = true;
+    const r = await post('/_send', {
+      signingKey: readKey(),
+      apiUrl: readUrl(),
+      roomId: document.getElementById('f-room').value.trim(),
+      text: document.getElementById('f-text').value,
+      body: document.getElementById('f-body').value,
+    }, sendOut, 'Signing and sending…');
+    sendBtn.disabled = false;
+    if (!r) { return; }
 
     const d = (r.response && r.response.data) || {};
     const head = r.ok
       ? '<p class="verdict ok">✔ ' + r.status + ' queued — room ' + esc(d.roomId || '?') +
         ', message ' + esc(d.messageId || '?') + '</p>' +
-        '<p class="dim" style="font-size:.85rem;margin:0">Accepted by the room pipeline — not yet delivered to the customer.</p>'
+        '<p class="dim small" style="margin:0">Accepted by the room pipeline — not yet delivered to the customer.</p>'
       : '<p class="verdict bad">✘ ' + r.status + ' ' + esc((r.response && r.response.msg) || '') + '</p>' +
         (r.status === 403
-          ? '<p class="dim" style="font-size:.85rem;margin:0">The platform will not say which half of the signature was wrong. Likely causes:</p>'
+          ? '<p class="dim small" style="margin:0">The platform will not say which half of the signature was wrong. Likely causes:</p>'
           : '');
-
-    const notes = r.notes && r.notes.length
-      ? '<ul>' + r.notes.map((n) => '<li>' + esc(n) + '</li>').join('') + '</ul>'
-      : '';
 
     const trace =
       '<details style="margin-top:.8rem"><summary class="dim" style="cursor:pointer;font-size:.85rem">Signature trace</summary>' +
-      '<table class="hdr" style="margin-top:.5rem">' +
-      Object.entries(r.request.headers).map(([k, v]) =>
-        '<tr><td class="mono dim">' + esc(k) + '</td><td class="mono brk">' + esc(v) + '</td></tr>').join('') +
-      (r.skew !== null ? '<tr><td class="mono dim">clock skew</td><td class="mono">' + esc(r.skew) + 's</td></tr>' : '') +
-      (r.requestAge !== null ? '<tr><td class="mono dim">age at server</td><td class="mono">' + esc(r.requestAge) + 's</td></tr>' : '') +
-      '</table>' +
-      '<p class="dim" style="font-size:.78rem;margin:.6rem 0 .2rem">signed bytes — HMAC-SHA256 over exactly this</p>' +
-      '<pre class="mono">' + esc(JSON.stringify(r.request.signedContent)) + '</pre>' +
-      '<p class="dim" style="font-size:.78rem;margin:.6rem 0 .2rem">body sent</p>' +
-      '<pre class="mono">' + esc(r.request.rawBody) + '</pre>' +
-      '<p class="dim" style="font-size:.78rem;margin:.6rem 0 .2rem">response</p>' +
-      '<pre class="mono">' + esc(JSON.stringify(r.response, null, 2)) + '</pre>' +
-      '</details>';
+      '<div style="margin-top:.5rem">' +
+      rowsOf(Object.entries(r.request.headers).concat([
+        ['url', r.request.url],
+        ['clock skew', r.skew === null ? '' : r.skew + 's'],
+        ['age at server', r.requestAge === null ? '' : r.requestAge + 's'],
+      ])) +
+      block('signed bytes — HMAC-SHA256 over exactly this', JSON.stringify(r.request.signedContent)) +
+      block('body sent', r.request.rawBody) +
+      block('curl repro', r.request.curl) +
+      block('response', JSON.stringify(r.response, null, 2)) +
+      '</div></details>';
 
-    out.innerHTML = head + notes + trace;
-    btn.disabled = false;
+    sendOut.innerHTML = head + notesOf(r.notes) + keyLine(r) + trace;
   });
 
-  // Poll rather than reload, so a copied URL selection and scroll position survive.
+  // ── signature ─────────────────────────────────────────────────────────────
+  const signOut = document.getElementById('g-out');
+  const signBtn = document.getElementById('g-go');
+  const signTs = document.getElementById('g-ts');
+
+  document.getElementById('g-stale').addEventListener('click', () => {
+    signTs.value = String(Math.floor(Date.now() / 1000) - 600);
+  });
+
+  signBtn.addEventListener('click', async () => {
+    signBtn.disabled = true;
+    const r = await post('/_sign', {
+      signingKey: readKey(),
+      apiUrl: readUrl(),
+      body: document.getElementById('g-body').value,
+      timestamp: signTs.value,
+    }, signOut, 'Hashing…');
+    signBtn.disabled = false;
+    if (!r) { return; }
+
+    const head =
+      '<p class="verdict ' + (r.warnings.length ? 'warn' : 'ok') + '">' +
+      (r.warnings.length ? '⚠ signature computed, with caveats' : '✔ signature computed') +
+      '</p>';
+
+    const summary = rowsOf([
+      ['x-pylot-timestamp', r.timestamp],
+      ['x-pylot-signature', r.signature],
+      ['age', r.age + 's' + (r.expired ? ' — expired (±' + r.tolerance + 's)' : ' — inside the ±' + r.tolerance + 's window')],
+      ['body', r.bodyBytes + ' bytes'],
+      ['signed', r.signedBytes + ' bytes'],
+      ['target', r.url],
+    ]);
+
+    const compare = r.compact
+      ? (r.compact.differs
+          ? block(
+              'the same body, compact — different bytes, so a different digest (' +
+                r.compact.digest.slice(0, 16) + '… vs ' + r.digest.slice(0, 16) + '…)',
+              r.compact.rawBody)
+          : '<p class="cap">already compact — re-serializing it changes nothing, so any client sends the bytes this digest covers.</p>')
+      : '';
+
+    signOut.innerHTML =
+      head + notesOf(r.warnings) + keyLine(r) +
+      '<div style="margin-top:.7rem">' + summary +
+      block('signed bytes — HMAC-SHA256 over exactly this', JSON.stringify(r.signedContent)) +
+      compare +
+      block('curl repro — sends the bytes that were hashed', r.curl) +
+      '</div>';
+  });
+
+  // ── live deliveries ───────────────────────────────────────────────────────
+  // Poll rather than reload: a reload here would wipe a half-typed message or a
+  // key you just pasted. New deliveries show up as a count on the tab instead,
+  // and the reload happens when you actually go look at them.
+  const seenTotal = ${s.total};
   setInterval(async () => {
     try {
-      const r = await fetch('/_state');
-      const s = await r.json();
-      if (s.total !== ${s.total}) location.reload();
+      const state = await (await fetch('/_state')).json();
+      if (state.total === seenTotal) { return; }
+      if (active === 'deliveries') { location.reload(); return; }
+      unseen = state.total - seenTotal;
+      pill.textContent = unseen;
+      pill.hidden = false;
     } catch {}
   }, 2000);
 </script>
@@ -792,10 +1176,10 @@ async function main() {
       `  ${red('sending ')}  ${SIGNING_SECRET.slice(0, 11)}… ${red('— not a valid signing key')} ${dim('(expected pwhsec_ + 64 hex)')}`,
     );
   } else if (SIGNING_SECRET) {
-    console.log(`  ${dim('sending ')}  ${dim(`${SIGNING_SECRET.slice(0, 11)}… → ${API_URL}/rooms/messages`)}`);
+    console.log(`  ${dim('sending ')}  ${dim(`${keyHint(SIGNING_SECRET)} → ${API_URL}/rooms/messages`)}`);
   } else {
     console.log(
-      `  ${yellow('No PYLOT_SIGNING_SECRET set')} ${dim('— sending is off. Run `node send.js --provision`.')}`,
+      `  ${yellow('No PYLOT_SIGNING_SECRET set')} ${dim(`— the CLI needs one (\`node send.js --provision\`); the web panel takes one pasted in. → ${API_URL}/rooms/messages`)}`,
     );
   }
   console.log(

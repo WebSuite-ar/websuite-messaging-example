@@ -34,8 +34,11 @@ try {
 }
 
 // ---------------------------------------------------------------- config
-const API_URL = (process.env.PYLOT_API_URL || 'http://localhost:4000/api/v2').replace(/\/+$/, '');
-const SIGNING_SECRET = process.env.PYLOT_SIGNING_SECRET || '';
+// The platform, unless `.env` or `--api` says otherwise. `/api/v2` is part of
+// it: the endpoint is POST /api/v2/rooms/messages and the code appends the rest.
+const DEFAULT_API_URL = 'https://api.websuite.ar/api/v2';
+const ENV_API_URL = (process.env.PYLOT_API_URL || DEFAULT_API_URL).replace(/\/+$/, '');
+const ENV_SIGNING_SECRET = process.env.PYLOT_SIGNING_SECRET || '';
 const TOKEN = process.env.PYLOT_TOKEN || '';
 const DEFAULT_ROOM = process.env.PYLOT_ROOM_ID || '';
 const DEFAULT_CONNECTION = process.env.PYLOT_USER_CONNECTION_ID || '';
@@ -66,6 +69,16 @@ function parseArgs(argv) {
 const { flags, rest } = parseArgs(process.argv.slice(2));
 const DEBUG = Boolean(flags.debug);
 
+// `--key` and `--api` beat `.env`, the CLI counterpart to the fields on the
+// receiver's send panel: a one-off send against another team or environment
+// shouldn't need an edit-and-restart cycle. Nothing is written back.
+const KEY_FROM_FLAG = typeof flags.key === 'string' && flags.key.trim() !== '';
+const SIGNING_SECRET = KEY_FROM_FLAG ? flags.key.trim() : ENV_SIGNING_SECRET;
+const API_URL = (typeof flags.api === 'string' && flags.api.trim()
+  ? flags.api.trim()
+  : ENV_API_URL
+).replace(/\/+$/, '');
+
 const USAGE = `
 ${bold('  Pylot signed message sender')}
 
@@ -75,6 +88,7 @@ ${bold('  Pylot signed message sender')}
     node send.js --room <roomId> --image <url> --caption "..."
     node send.js --connection <id> --to 18095550123 --name Jane --text "Hi"
     node send.js --body '{"roomId":"…","message":{…}}' ${dim('# full control')}
+    node send.js --key pwhsec_… --api https://api.websuite.ar/api/v2 --text "hi"
 
   ${dim('Debug')}
     --debug         show the signed bytes, the digest, the headers, a curl repro
@@ -84,8 +98,12 @@ ${bold('  Pylot signed message sender')}
     --tamper        sign the body, then alter it (demo a digest mismatch)
     --unsigned      send with PYLOT_TOKEN as a Bearer instead of a signature
 
+  ${dim('Override .env for one send')}
+    --key <pwhsec_…>  sign with this key instead of PYLOT_SIGNING_SECRET
+    --api <url>       post to this base instead of PYLOT_API_URL
+
   ${dim('Config')} ${dim(`(.env in ${__dirname})`)}
-    PYLOT_API_URL              ${dim('default http://localhost:4000/api/v2')}
+    PYLOT_API_URL              ${dim(`default ${DEFAULT_API_URL}`)}
     PYLOT_SIGNING_SECRET       ${dim('pwhsec_… from GET /rooms/signing-key')}
     PYLOT_ROOM_ID              ${dim('default target')}
     PYLOT_USER_CONNECTION_ID   ${dim('default channel for connect+send')}
@@ -171,15 +189,15 @@ async function provision() {
 async function check() {
   header('Config check');
   const rows = [
-    ['api url', API_URL, true],
+    ['api url', `${API_URL}${typeof flags.api === 'string' ? ' (--api)' : ''}`, true],
     ['.env', envFileLoaded ? `loaded from ${__dirname}` : `not found in ${__dirname} — using exported vars`, envFileLoaded],
     [
       'signing key',
       SIGNING_SECRET
         ? looksLikeSecret(SIGNING_SECRET)
-          ? `${SIGNING_SECRET.slice(0, 11)}… (well-formed)`
+          ? `${SIGNING_SECRET.slice(0, 11)}… (well-formed${KEY_FROM_FLAG ? ', from --key' : ''})`
           : `${SIGNING_SECRET.slice(0, 11)}… NOT a pwhsec_ + 64 hex key`
-        : 'not set',
+        : 'not set — pass --key, or set PYLOT_SIGNING_SECRET',
       Boolean(SIGNING_SECRET) && looksLikeSecret(SIGNING_SECRET),
     ],
     ['room id', DEFAULT_ROOM || 'not set', Boolean(DEFAULT_ROOM)],

@@ -8,6 +8,8 @@ A throwaway box for working on both halves of the Pylot messaging surface.
 - **Send** — signs a `POST /rooms/messages` with the team key (**no api key, no
   token**) and shows exactly what went on the wire: the bytes that were hashed,
   the digest, the headers, and — when the platform refuses — why it probably did.
+- **Sign** — body + key → signature, and nothing else. For checking a signature
+  your own code produced, without sending a message to anyone.
 
 Run both and you have the whole loop: send a message, watch the `message.sent`
 delivery it causes land in the same page.
@@ -32,7 +34,8 @@ Three values matter:
   **Create subscription**. Without it the receiver still prints payloads but
   cannot verify them, and says so loudly.
 - **`PYLOT_SIGNING_SECRET`** — the `pwhsec_…` **team signing key**, for sending.
-  `npm run provision` fetches it. Without it, sending is off.
+  `npm run provision` fetches it. Optional: leave it out and type the key into
+  the UI's **Send** or **Signature** tab instead (or pass `--key` to `send.js`).
 - **`NGROK_AUTHTOKEN`** — a free token from
   [ngrok](https://dashboard.ngrok.com/get-started/your-authtoken). Without it the
   receiver runs local-only and the platform cannot reach it.
@@ -67,9 +70,21 @@ Then create a subscription pointing at the public URL and fire **Send test
 event** — from the WebSuite Postman collection, or however you manage
 subscriptions.
 
-The same URL, opened in a browser, serves a status page: outstanding setup
-steps, verification state, and the last 25 deliveries with their full headers
-and payloads expandable.
+The same URL, opened in a browser, serves a status page. Outstanding setup steps
+sit at the top; everything else is behind a tab, so you get one thing at a time:
+
+| Tab | What it does |
+| --- | --- |
+| **Send a message** | the signed `POST /rooms/messages`, with the trace |
+| **Signature** | body + key → signature, computed and explained; nothing sent |
+| **Deliveries** | the last 25 deliveries, headers and payloads expandable. Counts new arrivals on the tab rather than reloading under you |
+| **Setup** | where config came from, and what to put in `.env` |
+
+The **signing key** and **API base** are fields in the send-side tabs, not just
+`.env` values. A key typed there wins over `.env`, is used to sign that one
+request and then forgotten — nothing is written to disk, and it never reaches
+the platform, only the signature does. It is held in the browser tab's
+`sessionStorage`, so it survives a refresh and dies with the tab.
 
 Each delivery prints as:
 
@@ -112,9 +127,10 @@ npm run provision          # GET /rooms/signing-key, needs PYLOT_TOKEN once
   PYLOT_SIGNING_SECRET=pwhsec_9c1a…
 ```
 
-Put that in `.env`. It's the *only* credential the sender needs afterwards —
-that one JWT was just to fetch it. Rotating (`POST /rooms/signing-key/rotate`)
-invalidates it immediately, with no grace window.
+Put that in `.env` — or skip `.env` and paste it into the **Send** tab, or pass
+`--key`. It's the *only* credential the sender needs afterwards; that one JWT was
+just to fetch it. Rotating (`POST /rooms/signing-key/rotate`) invalidates it
+immediately, with no grace window.
 
 ### 2. Send
 
@@ -123,7 +139,12 @@ npm run send -- --text "Your order #1042 has shipped 📦"
 node send.js --room 664f… --text "hi"
 node send.js --connection 664f… --to 18095550123 --name Jane --text "Hi Jane 👋"
 node send.js --body '{"roomId":"664f…","message":{"type":"text","text":{"value":"hi"}}}'
+node send.js --key pwhsec_… --api https://api.websuite.ar/api/v2 --text "hi"
 ```
+
+`--key` and `--api` override `PYLOT_SIGNING_SECRET` and `PYLOT_API_URL` for that
+one send — the CLI counterpart to the fields in the UI. Neither writes anything
+back to `.env`.
 
 ```
   Send (HMAC signed)
@@ -143,9 +164,29 @@ node send.js --body '{"roomId":"664f…","message":{"type":"text","text":{"value
 yet. Subscribe to `message.sent` / `message.failed` and leave `npm start`
 running to watch it actually land.
 
-Or use the **Send a message** panel on the receiver's status page, which does the
-same thing with the trace rendered inline — and shows the resulting delivery
-directly underneath it.
+Or use the **Send a message** tab on the receiver's status page, which does the
+same thing with the trace rendered inline — and counts the resulting delivery on
+the **Deliveries** tab.
+
+### Just the signature
+
+When the question is "is my signature right?" rather than "did the message
+land", the **Signature** tab takes a body and a key and computes the two
+headers without sending anything:
+
+```
+x-pylot-timestamp: <unix seconds>
+x-pylot-signature: sha256=hex(HMAC_SHA256(key, timestamp + "." + body))
+```
+
+It hashes the body **exactly as typed** — whitespace, key order, unicode
+escaping and all — and then, if the body parses as JSON, shows the digest of its
+compact re-serialization too. Those two digests differing is the point: it is
+what "serialize once, hash that string, send that string" looks like when you
+get it wrong, and it is the most common cause of a 403 nobody can explain. The
+tab also flags a key that isn't `pwhsec_` + 64 hex, a body that isn't valid
+JSON, and a timestamp already outside the ±300s window, and hands you a `curl`
+that sends precisely the bytes it hashed.
 
 ### 3. Debug
 
@@ -216,8 +257,8 @@ failure-cause table, is in `ts-node-be/docs/signing-room-messages.md`.
 | `TOLERANCE_SECONDS` | `300` | Replay window, matching the platform. |
 | `REJECT_INVALID` | off | Reply **401** on a bad signature instead of 200. Use this to watch the platform's retry schedule (1/3/10/30/60s, cap 5) actually fire. |
 | `NO_TUNNEL` | off | Skip ngrok entirely (`npm run start:local`). |
-| `PYLOT_API_URL` | `http://localhost:4000/api/v2` | Where to send. |
-| `PYLOT_SIGNING_SECRET` | — | Team signing key. Omit and sending is off. |
+| `PYLOT_API_URL` | `https://api.websuite.ar/api/v2` | Where to send. The `/api/v2` is part of it. Overridable in the UI, or with `--api`. |
+| `PYLOT_SIGNING_SECRET` | — | Team signing key. Omit it and type the key into the UI, or pass `--key`. |
 | `PYLOT_ROOM_ID` | — | Default send target. |
 | `PYLOT_USER_CONNECTION_ID` | — | Default channel, for connect+send. |
 | `PYLOT_TOKEN` | — | JWT. Only `--provision` and `--unsigned` use it. |
@@ -244,4 +285,7 @@ that failed. `REJECT_INVALID=1` makes it behave like a real receiver.
   signature. Serialize once, hash that string, send that string.
 - The web panel signs on the **server** and proxies. A signature computed in a
   browser means the key is in the browser, which means anyone with devtools can
-  send as the team. The key never leaves this process.
+  send as the team. A key you paste into the UI is posted to this local process,
+  which signs and forgets it; it is never forwarded to the platform, and only
+  the signature comes back. That is still a credential typed into a web page, so
+  the page is worth keeping on localhost — which is where it runs.
